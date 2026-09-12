@@ -557,8 +557,10 @@ smart-order-routing/
 │   ├── backtester.py
 │   └── metrics.py
 │
-├── dashboard/
-│   └── app.py
+├── frontend/
+│   ├── src/
+│   ├── package.json
+│   └── README.md
 │
 ├── notebooks/
 │   └── analysis.ipynb
