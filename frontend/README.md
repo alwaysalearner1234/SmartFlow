@@ -1,6 +1,6 @@
 # SmartFlow dashboard — Phase 1 contract
 
-The frontend uses React, TypeScript, Vite and Plotly. The planning document's Python `dashboard/app.py` and component filenames predate the team's React decision; equivalent React components live in `frontend/src/components/` and chart definitions in `frontend/src/charts/plots.tsx`.
+The frontend uses React, TypeScript, Vite and Plotly. Main also contains a working Python Streamlit dashboard at `dashboard/app.py`. The team needs to decide which UI is the primary demo; the React components live in `frontend/src/components/` and chart definitions in `frontend/src/charts/plots.tsx`.
 
 ## Information architecture
 
@@ -14,6 +14,8 @@ The frontend uses React, TypeScript, Vite and Plotly. The planning document's Py
 The initial page shows all four views. Missing sections show an empty state; no result is fabricated.
 
 ## API contract
+
+**Integration status:** Main currently runs Streamlit directly against Python modules. It has no FastAPI service or `/api/v1/dashboard/snapshot` endpoint. The TypeScript interface below is a proposed boundary, not an implemented backend response.
 
 `GET /api/v1/dashboard/snapshot` returns `DashboardSnapshot` from [`src/types.ts`](src/types.ts). `schema_version` must be `"1.0"`. The four section values may be `null` until their producers are ready. Vite proxies `/api` to `http://127.0.0.1:8000`; set `VITE_API_BASE_URL` to override the API origin.
 
@@ -34,6 +36,14 @@ All timestamps are UTC ISO 8601 strings. Quantities use the instrument's base un
 `ExecutionState.trajectory` is ordered by timestamp. Each point contains remaining and cumulative filled quantity, reference price, nullable execution price, and selected action. `PerformanceState.results` contains one entry per available strategy. Chart inputs are these typed arrays; missing or empty arrays produce empty states. Backtest metrics must come from actual simulation output.
 
 The API can initially return the all-null snapshot above. Later, Person 1 supplies `market`, Person 2 and Person 3 supply `risk`, and Person 3 supplies `execution` and `performance`. The backend should assemble one snapshot, keeping a consistent run/order identity across sections. The frontend currently fetches once on page load; live refresh can be added after the API transport and update cadence are agreed.
+
+Before backend integration, agree on these mappings with the module owners:
+
+- Python `MarketSnapshot.timestamp` is a `float`; convert it to an explicit UTC ISO 8601 string at the API boundary and confirm its epoch/unit. Python book levels are `(price, size)` tuples; serialize them as `{ price, quantity }`.
+- Python `OrderSide` uses `BUY`/`SELL`; the frontend uses lowercase values. Python strategy names must be mapped to the frontend's strategy identifiers.
+- `PredictionResult.prediction_horizon` is measured in **ticks**, while the proposed frontend field `prediction_horizon_ms` is time. Do not convert without a defined tick cadence; change the API field/unit or expose both explicitly.
+- `ExecutionDecision.urgency` may provide the continuous score, but the selected action needs an agreed mapping from the Python strategy decision. `ExecutionResult` provides shortfall in bps, while slippage, impact, and adverse-selection cost are in quote-currency amounts and need an agreed bps conversion.
+- The current `FillModel` simulates fills but exposes no dashboard `fill_probability` contract. The value should remain unavailable until the owner defines an estimator and horizon; do not display an invented zero.
 
 ## Run
 
