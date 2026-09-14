@@ -4,26 +4,66 @@ Renders adverse-selection probabilities, model verification status,
 and key feature drivers.
 """
 
+from typing import Optional
 import streamlit as st
 import pandas as pd
-from data.contracts import PredictionResult, ModelStatus, RiskCategory
+from data.contracts import PredictionResult, ModelStatus, RiskCategory, ModelSystemStatus
 from dashboard.charts.plots import plot_risk_gauge
 
 
-def render_risk_monitor_component(pred: PredictionResult):
+def render_risk_monitor_component(
+    pred: PredictionResult,
+    status_info: Optional[ModelSystemStatus] = None,
+):
     """
     Renders the ML adverse selection risk monitor and model status.
+    Uses unified ModelSystemStatus as the single source of truth.
     """
     st.markdown("### 🤖 ML Adverse-Selection Risk Engine")
 
-    # Status alert banner
-    if pred.model_status == ModelStatus.TRAINED:
-        st.success(f"✅ **Production ML Model Active:** {pred.model_name} (Horizon: {pred.prediction_horizon} ticks)")
+    # Unified Status alert banner
+    if status_info is not None:
+        if status_info.status == ModelStatus.TRAINED:
+            st.markdown(
+                f"""
+                <div style="background-color: rgba(0, 255, 163, 0.1); border: 1px solid #00FFA3;
+                            border-radius: 6px; padding: 10px 14px; margin-bottom: 14px;">
+                    <span style="font-size: 15px; font-weight: 700; color: #00FFA3;">🟢 Trained Model Loaded</span> &nbsp;|&nbsp;
+                    <span style="color: #FFFFFF; font-weight: 600;">{status_info.model_name}</span> &nbsp;
+                    <span style="color: #8E99AB; font-size: 12px;">({status_info.model_version})</span>
+                    <div style="font-size: 12px; color: #CBD5E1; margin-top: 4px;">{status_info.details}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        elif status_info.status in [ModelStatus.FALLBACK, ModelStatus.FALLBACK_HEURISTIC]:
+            st.markdown(
+                f"""
+                <div style="background-color: rgba(243, 186, 47, 0.1); border: 1px solid #F3BA2F;
+                            border-radius: 6px; padding: 10px 14px; margin-bottom: 14px;">
+                    <span style="font-size: 15px; font-weight: 700; color: #F3BA2F;">🟡 Development Fallback</span> &nbsp;|&nbsp;
+                    <span style="color: #FFFFFF; font-weight: 600;">{status_info.model_name}</span>
+                    <div style="font-size: 12px; color: #CBD5E1; margin-top: 4px;">{status_info.details}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div style="background-color: rgba(255, 0, 85, 0.1); border: 1px solid #FF0055;
+                            border-radius: 6px; padding: 10px 14px; margin-bottom: 14px;">
+                    <span style="font-size: 15px; font-weight: 700; color: #FF0055;">🔴 Model Unavailable</span>
+                    <div style="font-size: 12px; color: #CBD5E1; margin-top: 4px;">Inference unavailable.</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
     else:
-        st.warning(
-            f"⚠️ **Development Fallback Mode:** {pred.model_name} — "
-            "Model has not yet been trained on historical data. Using calibrated microstructure statistical heuristic."
-        )
+        if pred.model_status == ModelStatus.TRAINED:
+            st.success(f"🟢 **Trained Model Loaded:** {pred.model_name} (Horizon: {pred.prediction_horizon} ticks)")
+        else:
+            st.warning(f"🟡 **Development Fallback:** {pred.model_name} (Calibrated Microstructure Heuristic)")
 
     r_col1, r_col2 = st.columns([1.2, 1.0])
 

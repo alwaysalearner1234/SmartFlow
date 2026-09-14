@@ -42,7 +42,62 @@ class RiskCategory(str, Enum):
 
 class ModelStatus(str, Enum):
     TRAINED = "TRAINED"
+    FALLBACK = "FALLBACK"
     FALLBACK_HEURISTIC = "FALLBACK_HEURISTIC"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class MarketRegime(str, Enum):
+    CALM = "Calm"
+    NORMAL = "Normal"
+    VOLATILE = "Volatile"
+    HIGHLY_VOLATILE = "Highly Volatile"
+    ILLIQUID = "Illiquid"
+
+
+@dataclass
+class ModelSystemStatus:
+    """Standardized single source of truth for ML model status across the system."""
+    is_loaded: bool
+    model_name: str
+    model_version: str
+    status: ModelStatus
+    status_label: str
+    prediction_available: bool
+    details: str
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    feature_importances: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class VenueQuote:
+    """Represents quote and routing metrics for an individual simulated trading venue."""
+    venue_id: str
+    venue_name: str
+    best_bid: float
+    best_ask: float
+    bid_depth: float
+    ask_depth: float
+    spread: float
+    spread_bps: float
+    liquidity_score: float  # 0.0 - 1.0 (relative depth quality)
+    execution_risk: float   # 0.0 - 1.0 (volatility / adverse toxicity risk)
+    est_cost_bps: float     # Estimated total execution cost in bps
+    routed_quantity: float = 0.0
+    allocation_pct: float = 0.0
+
+
+@dataclass
+class VenueRoutingResult:
+    """Result of multi-venue smart order routing allocation."""
+    timestamp: float
+    total_quantity: float
+    side: OrderSide
+    venues: List[VenueQuote]
+    explanation: str
+    avg_price: float = 0.0
+    effective_spread_bps: float = 0.0
+    total_cost_est: float = 0.0
 
 
 @dataclass

@@ -12,7 +12,13 @@ import pandas as pd
 import joblib
 
 from config.config import ModelConfig, SAVED_MODELS_DIR
-from data.contracts import PredictionResult, ModelStatus, RiskCategory, OrderSide
+from data.contracts import (
+    PredictionResult,
+    ModelStatus,
+    RiskCategory,
+    OrderSide,
+    ModelSystemStatus,
+)
 from models.preprocessing import DEFAULT_FEATURE_COLS
 
 
@@ -27,6 +33,8 @@ class AdverseSelectionPredictor:
         self.feature_names = DEFAULT_FEATURE_COLS
         self.model_name = "Heuristic Statistical Microstructure Fallback"
         self.model_status = ModelStatus.FALLBACK_HEURISTIC
+        self.model_version = "v0.9-heuristic"
+        self.model_metrics: Dict[str, Any] = {}
         self.feature_importances: Dict[str, float] = {}
 
         self._load_model_if_available()
@@ -40,17 +48,64 @@ class AdverseSelectionPredictor:
                 self.scaler = bundle["scaler"]
                 self.feature_names = bundle["feature_names"]
                 self.model_name = bundle.get("best_name", "Trained ML Classifier")
+                self.model_version = bundle.get("version", "v1.0-production")
                 self.model_status = ModelStatus.TRAINED
-                metrics = bundle.get("metrics", {})
-                self.feature_importances = metrics.get("feature_importances", {})
+                self.model_metrics = bundle.get("metrics", {})
+                self.feature_importances = self.model_metrics.get("feature_importances", {})
                 return True
             except Exception:
                 self.model_status = ModelStatus.FALLBACK_HEURISTIC
+        else:
+            self.model_status = ModelStatus.FALLBACK_HEURISTIC
         return False
 
     def reload(self) -> bool:
         """Forces reload of the saved model from disk."""
         return self._load_model_if_available()
+
+    def get_model_status_info(self) -> ModelSystemStatus:
+        """Returns standardized single source of truth for model status."""
+        if self.model_status == ModelStatus.TRAINED and self.model is not None:
+            return ModelSystemStatus(
+                is_loaded=True,
+                model_name=self.model_name,
+                model_version=self.model_version,
+                status=ModelStatus.TRAINED,
+                status_label="🟢 Trained Model Loaded",
+                prediction_available=True,
+                details=f"Production supervised classifier trained with zero-leakage cross-validation. Active horizon: {self.horizon} ticks.",
+                metrics=self.model_metrics,
+                feature_importances=self.feature_importances,
+            )
+        elif self.model_status in [ModelStatus.FALLBACK, ModelStatus.FALLBACK_HEURISTIC]:
+            return ModelSystemStatus(
+                is_loaded=False,
+                model_name="Microstructure Heuristic Fallback",
+                model_version="v0.9-heuristic",
+                status=ModelStatus.FALLBACK,
+                status_label="🟡 Development Fallback",
+                prediction_available=True,
+                details="Operating on calibrated multi-level depth imbalance, spread expansion, and order flow heuristic.",
+                metrics={},
+                feature_importances={
+                    "depth_imbalance_l1": 0.35,
+                    "spread_expansion_ratio": 0.25,
+                    "momentum_ret_5": 0.20,
+                    "trade_volume_imbalance": 0.20,
+                },
+            )
+        else:
+            return ModelSystemStatus(
+                is_loaded=False,
+                model_name="None",
+                model_version="N/A",
+                status=ModelStatus.UNAVAILABLE,
+                status_label="🔴 Model Unavailable",
+                prediction_available=False,
+                details="No predictive model or heuristic engine available.",
+                metrics={},
+                feature_importances={},
+            )
 
     def predict(
         self,

@@ -14,7 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from data.contracts import MarketSnapshot, ExecutionResult, BacktestResult
+from data.contracts import MarketSnapshot, ExecutionResult, BacktestResult, VenueRoutingResult
 
 DARK_TEMPLATE = "plotly_dark"
 COLOR_BID = "#00F0FF"      # Cyan / Neon Blue for bids
@@ -46,7 +46,7 @@ def plot_order_book_depth(snapshot: MarketSnapshot) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=bid_prices,
             y=bid_cum_sizes,
-            name="Cumulative Bids (Makers)",
+            name="Cumulative Bid Depth",
             fill="tozeroy",
             mode="lines+markers",
             line=dict(color=COLOR_BID, width=2.5),
@@ -57,7 +57,7 @@ def plot_order_book_depth(snapshot: MarketSnapshot) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=ask_prices,
             y=ask_cum_sizes,
-            name="Cumulative Asks (Takers)",
+            name="Cumulative Ask Depth",
             fill="tozeroy",
             mode="lines+markers",
             line=dict(color=COLOR_ASK, width=2.5),
@@ -271,6 +271,53 @@ def plot_comparison_metrics(df_comparison: pd.DataFrame) -> go.Figure:
         plot_bgcolor=COLOR_CARD,
         height=340,
         margin=dict(l=40, r=40, t=50, b=40),
+        showlegend=False,
+    )
+    return fig
+
+
+def plot_venue_allocations(routing_result: VenueRoutingResult) -> go.Figure:
+    """
+    Renders a visual allocation bar chart showing order distribution across simulated venues.
+    """
+    venues = routing_result.venues
+    venue_labels = [v.venue_name for v in venues]
+    allocations = [v.routed_quantity for v in venues]
+    percentages = [v.allocation_pct for v in venues]
+
+    colors = ["#00FFA3", "#00F0FF", "#F3BA2F", "#A78BFA"]
+    text_labels = [f"{q:,.0f} units ({pct:.1f}%)" for q, pct in zip(allocations, percentages)]
+
+    fig = go.Figure(
+        go.Bar(
+            x=allocations,
+            y=venue_labels,
+            orientation="h",
+            marker=dict(
+                color=colors[:len(venues)],
+                line=dict(color="#1E2638", width=1.5),
+            ),
+            text=text_labels,
+            textposition="inside",
+            insidetextanchor="middle",
+        )
+    )
+
+    fig.update_layout(
+        template=DARK_TEMPLATE,
+        paper_bgcolor=COLOR_BG,
+        plot_bgcolor=COLOR_CARD,
+        height=240,
+        margin=dict(l=20, r=20, t=30, b=30),
+        xaxis=dict(
+            title="Routed Quantity (Units)",
+            showgrid=True,
+            gridcolor="#1E2638",
+        ),
+        yaxis=dict(
+            autorange="reversed",
+            showgrid=False,
+        ),
         showlegend=False,
     )
     return fig
