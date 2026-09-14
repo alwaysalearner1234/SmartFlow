@@ -19,6 +19,7 @@ from features.spread import extract_spread_features, calculate_spread_bps
 from features.momentum import extract_momentum_features
 from features.volatility import extract_volatility_features
 from features.trade_flow import extract_trade_flow_features
+from features.regime import detect_market_regime, MarketRegimeInfo
 
 
 def build_feature_pipeline(
@@ -83,4 +84,6 @@ __all__ = [
     "extract_trade_flow_features",
     "build_feature_pipeline",
     "extract_snapshot_features_dict",
+    "detect_market_regime",
+    "MarketRegimeInfo",
 ]
