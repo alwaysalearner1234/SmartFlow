@@ -264,4 +264,10 @@ Tests cover:
 
 ## 14. License
 
-Distributed under the MIT License. See [LICENSE](file:///c:/Users/lidiy/Downloads/SmartFlow/LICENSE) for details.
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## 15. React Frontend (Phase 1)
+
+An alternative React + Plotly frontend skeleton and its proposed data contract live in [frontend/](frontend/README.md). The Streamlit dashboard above is the currently integrated UI. The React frontend requires a FastAPI endpoint before it can display backend data; see its README for the outstanding integration decisions.
