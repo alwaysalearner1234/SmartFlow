@@ -114,7 +114,10 @@ class AdverseSelectionPredictor:
         timestamp: float = 0.0,
     ) -> PredictionResult:
         """
-        Calculates adverse-selection probability.
+        Calculates adverse-selection / passive-exposure toxicity probability.
+
+        The returned probability estimates how unsafe it is to rest a maker order.
+        It is not a forecast of future price direction.
         Guarantees returned PredictionResult adheres strictly to system contract.
         """
         # Convert dictionary to single-row DataFrame if necessary

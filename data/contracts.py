@@ -40,6 +40,14 @@ class RiskCategory(str, Enum):
     HIGH = "HIGH"
 
 
+class ExecutionMode(str, Enum):
+    """Typed execution action. AUTO preserves legacy strategy-name inference."""
+    AUTO = "auto"
+    HOLD = "hold"
+    PASSIVE = "passive"
+    AGGRESSIVE = "aggressive"
+
+
 class ModelStatus(str, Enum):
     TRAINED = "TRAINED"
     FALLBACK = "FALLBACK"
@@ -211,7 +219,13 @@ class Fill:
 
 @dataclass
 class PredictionResult:
-    """Represents the output from the ML adverse selection risk model."""
+    """
+    Output from the adverse-selection / passive-exposure risk model.
+
+    `probability` estimates how dangerous it is to rest a maker order right now
+    (toxic-fill / winner's-curse risk). It is not a directional forecast of
+    where price will go and must not, by itself, justify accelerating a trade.
+    """
     probability: float
     timestamp: float
     prediction_horizon: int
@@ -242,6 +256,8 @@ class ExecutionDecision:
     remaining_quantity: float
     limit_price: Optional[float] = None
     expected_cost: float = 0.0
+    execution_mode: ExecutionMode = ExecutionMode.AUTO
+    cancel_active_orders: bool = False
 
 
 @dataclass

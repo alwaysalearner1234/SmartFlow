@@ -70,10 +70,10 @@ class AlmgrenChrissConfig:
 @dataclass(frozen=True)
 class ExecutionConfig:
     """Dynamic strategy engine thresholds."""
-    risk_low_threshold: float = 0.35   # Below this, market is benign -> favor passive
-    risk_high_threshold: float = 0.65  # Above this, high adverse risk -> favor aggressive / urgent
+    risk_low_threshold: float = 0.35   # Below this, passive maker exposure is considered relatively safe
+    risk_high_threshold: float = 0.65  # Above this, passive maker exposure is considered toxic and should be suppressed
     urgency_low_threshold: float = 0.3
-    urgency_high_threshold: float = 0.75
+    urgency_high_threshold: float = 0.75  # Above this, completion pressure may force aggressive execution even if passive risk is high
     passive_price_offset_ticks: int = 0 # Post at best quote
     max_participation_rate: float = 0.20 # Max % of visible top level volume per order
 

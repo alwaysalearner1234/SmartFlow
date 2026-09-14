@@ -1,18 +1,31 @@
 """
-Proposed Risk-Aware Smart Order Routing (SOR) & Dynamic Execution Strategy.
-Combines:
-- ML Adverse-Selection Probability
-- Almgren-Chriss Optimal Cost Trajectory
-- Order Flow & Depth Imbalance
-- Bid-Ask Spread Dynamics & Expansion
-- Short-term Momentum & Volatility Regimes
-- Execution Urgency & Inventory Completion
-Dynamically switches between Passive Maker, Aggressive Taker, and Scheduled Slicing.
+Proposed SmartFlow execution strategy.
+
+Separates three independent signals:
+
+1. Adverse-selection / passive-exposure risk
+   Answers: "How dangerous is it to rest a maker order right now?"
+   Controls only whether passive exposure is safe. It is not a price-direction forecast.
+
+2. Execution urgency / completion pressure
+   Answers: "How urgently do we need to trade to finish the parent order?"
+   Driven by elapsed time, remaining inventory, horizon, and AC guidance.
+
+3. Almgren-Chriss schedule
+   Answers: "How much inventory should we execute this cycle?"
+   Controls sizing/trajectory, not short-term market direction.
+
+A directional price forecast is intentionally out of scope for this layer.
 """
 
-from typing import Any, Optional, Dict
-import numpy as np
-from data.contracts import MarketSnapshot, ExecutionDecision, OrderSide, PredictionResult
+from typing import Any, Optional
+from data.contracts import (
+    MarketSnapshot,
+    ExecutionDecision,
+    ExecutionMode,
+    OrderSide,
+    PredictionResult,
+)
 from strategies.base import BaseExecutionStrategy
 from execution.almgren_chriss import AlmgrenChrissModel
 from models.predictor import AdverseSelectionPredictor
@@ -20,9 +33,9 @@ from models.predictor import AdverseSelectionPredictor
 
 class ProposedStrategy(BaseExecutionStrategy):
     """
-    Intelligent Risk-Aware Smart Order Routing & Execution Strategy.
-    Dynamically balances adverse selection avoidance, market impact cost,
-    and deadline risk.
+    Risk-aware execution that withdraws toxic maker exposure, follows the
+    Almgren-Chriss inventory trajectory, and only crosses the spread when
+    completion urgency (or scheduled AC progress) requires it.
     """
 
     def __init__(
@@ -50,37 +63,31 @@ class ProposedStrategy(BaseExecutionStrategy):
         **kwargs: Any,
     ) -> ExecutionDecision:
         if remaining_quantity <= 0:
-            return ExecutionDecision(
-                timestamp=snapshot.timestamp,
-                strategy=self.name,
+            return self._build_decision(
+                snapshot=snapshot,
                 side=side,
                 quantity=0.0,
+                limit_price=None,
                 urgency=0.0,
                 risk_score=0.0,
-                reason="Order fully executed.",
                 remaining_quantity=0.0,
+                expected_cost=0.0,
+                execution_mode=ExecutionMode.HOLD,
+                cancel_active_orders=False,
+                reason="Order complete. Remaining quantity is 0; no further execution is required.",
             )
 
         initial_qty = kwargs.get("initial_quantity", remaining_quantity)
         rem_ratio = remaining_quantity / max(1.0, initial_qty)
         urgency = self.calculate_urgency(elapsed_time, total_horizon, rem_ratio)
 
-        # 1. Obtain adverse selection prediction
+        # Adverse-selection probability is a passive-exposure toxicity signal only.
         pred_res: Optional[PredictionResult] = kwargs.get("prediction_result")
         if pred_res is None:
             features = kwargs.get("features", {})
             pred_res = self.predictor.predict(features, side=side, timestamp=snapshot.timestamp)
-
         risk_score = pred_res.probability
 
-        # 2. Extract microstructure state
-        spread_bps = (snapshot.spread / snapshot.mid_price) * 10000.0 if snapshot.mid_price > 0 else 0.0
-        depth_imb = kwargs.get("depth_imbalance", 0.0)
-        volatility = kwargs.get("volatility", 0.20)
-        best_bid_s = snapshot.best_bid_size
-        best_ask_s = snapshot.best_ask_size
-
-        # 3. Almgren-Chriss baseline guidance
         time_rem = max(1.0, total_horizon - elapsed_time)
         sched = self.ac_model.generate_schedule(
             total_quantity=remaining_quantity,
@@ -91,76 +98,137 @@ class ProposedStrategy(BaseExecutionStrategy):
         ac_slice = sched.trade_sizes[0] if len(sched.trade_sizes) > 0 else remaining_quantity
         expected_cost = sched.expected_cost
 
-        # 4. Dynamic Execution Engine Decision Tree
-        # Condition A: Extreme Urgency near deadline
+        # CASE B — completion urgency dominates, including when passive risk is high.
         if urgency >= self.urgency_high_thresh:
             slice_size = min(remaining_quantity, max(ac_slice * 1.5, remaining_quantity * 0.4))
             limit_p = snapshot.best_ask if side == OrderSide.BUY else snapshot.best_bid
             reason = (
-                f"High deadline urgency ({urgency:.2f} >= {self.urgency_high_thresh:.2f}); "
-                f"sweeping spread aggressively for {slice_size:.1f} units to prevent execution shortfall."
+                f"Passive adverse-selection risk is {risk_score:.2f}. "
+                f"Completion urgency is {urgency:.2f} and exceeds the {self.urgency_high_thresh:.2f} threshold. "
+                f"Passive exposure is no longer appropriate because execution completion now dominates "
+                f"spread-capture considerations. Resulting mode: AGGRESSIVE. "
+                f"Executing an aggressive Almgren-Chriss-guided slice of {slice_size:.1f} units "
+                f"to reduce completion shortfall (AC expected cost ${expected_cost:.2f})."
             )
-            sub_strat = "Aggressive (Urgent)"
+            return self._build_decision(
+                snapshot=snapshot,
+                side=side,
+                quantity=slice_size,
+                limit_price=limit_p,
+                urgency=urgency,
+                risk_score=risk_score,
+                remaining_quantity=remaining_quantity,
+                expected_cost=expected_cost,
+                execution_mode=ExecutionMode.AGGRESSIVE,
+                cancel_active_orders=True,
+                reason=reason,
+            )
 
-        # Condition B: High Adverse-Selection Risk detected
-        elif risk_score >= self.risk_high_thresh:
-            # Toxic order flow is moving against our resting quote!
-            # If we are BUYING and price is plunging, resting bids get adversely filled.
-            # We back off or immediately cross if we must complete.
-            if rem_ratio > 0.5:
-                # Still significant inventory to execute: cross spread quickly before price moves further
-                slice_size = min(remaining_quantity, max(ac_slice, best_ask_s * 0.4 if side == OrderSide.BUY else best_bid_s * 0.4))
-                limit_p = snapshot.best_ask if side == OrderSide.BUY else snapshot.best_bid
-                sub_strat = "Aggressive (Risk Defense)"
-                reason = (
-                    f"Elevated adverse-selection risk ({risk_score:.2f} >= {self.risk_high_thresh:.2f}) "
-                    f"with unfavorable depth imbalance ({depth_imb:.2f}); taking available opposite depth before adverse move."
-                )
-            else:
-                # Little inventory left, pause passive orders to avoid being picked off
-                slice_size = 0.0
-                limit_p = snapshot.best_bid if side == OrderSide.BUY else snapshot.best_ask
-                sub_strat = "Passive (Withdrawn)"
-                reason = (
-                    f"Withdrawing passive quotes: adverse selection risk high ({risk_score:.2f}) "
-                    f"to prevent winner's curse on remaining {remaining_quantity:.1f} units."
-                )
+        # CASE C — high toxicity, not urgent: withdraw maker exposure. Do not infer direction.
+        if risk_score >= self.risk_high_thresh:
+            reason = (
+                f"Passive adverse-selection risk is elevated at {risk_score:.2f}, "
+                f"at or above the {self.risk_high_thresh:.2f} toxicity threshold. "
+                f"Completion urgency is {urgency:.2f}, below the {self.urgency_high_thresh:.2f} aggressive threshold. "
+                f"Resulting mode: HOLD. Resting maker exposure is withdrawn and no new order is "
+                f"submitted this cycle because passive fills are currently unsafe. "
+                f"Almgren-Chriss still schedules a slice of {ac_slice:.1f} units, but that inventory "
+                f"is deferred until either toxicity falls or completion pressure rises."
+            )
+            return self._build_decision(
+                snapshot=snapshot,
+                side=side,
+                quantity=0.0,
+                limit_price=None,
+                urgency=urgency,
+                risk_score=risk_score,
+                remaining_quantity=remaining_quantity,
+                expected_cost=expected_cost,
+                execution_mode=ExecutionMode.HOLD,
+                cancel_active_orders=True,
+                reason=reason,
+            )
 
-        # Condition C: Low Adverse-Selection Risk + Benign Liquidity
-        elif risk_score <= self.risk_low_thresh and spread_bps <= 15.0:
-            # Safe market environment: capture spread by posting passively at best bid/ask
-            passive_depth = best_bid_s if side == OrderSide.BUY else best_ask_s
+        # CASE D — low toxicity: maker exposure is relatively safe.
+        if risk_score <= self.risk_low_thresh:
+            passive_depth = snapshot.best_bid_size if side == OrderSide.BUY else snapshot.best_ask_size
             slice_size = min(remaining_quantity, max(20.0, passive_depth * 0.3))
             limit_p = snapshot.best_bid if side == OrderSide.BUY else snapshot.best_ask
-            sub_strat = "Passive (Maker)"
             reason = (
-                f"Low adverse selection risk ({risk_score:.2f} <= {self.risk_low_thresh:.2f}) "
-                f"and tight spread ({spread_bps:.1f} bps); capturing spread via passive maker quote."
+                f"Passive adverse-selection risk is low at {risk_score:.2f}, "
+                f"at or below the {self.risk_low_thresh:.2f} safe-exposure threshold. "
+                f"Completion urgency is {urgency:.2f}, below the {self.urgency_high_thresh:.2f} aggressive threshold. "
+                f"Resulting mode: PASSIVE. SmartFlow is exposing a maker order of {slice_size:.1f} units "
+                f"at the same-side best quote ({limit_p:.4f}) to capture spread while maintaining "
+                f"execution progress (Almgren-Chriss reference slice {ac_slice:.1f} units)."
+            )
+            return self._build_decision(
+                snapshot=snapshot,
+                side=side,
+                quantity=slice_size,
+                limit_price=limit_p,
+                urgency=urgency,
+                risk_score=risk_score,
+                remaining_quantity=remaining_quantity,
+                expected_cost=expected_cost,
+                execution_mode=ExecutionMode.PASSIVE,
+                cancel_active_orders=False,
+                reason=reason,
             )
 
-        # Condition D: Moderate Risk -> Follow Almgren-Chriss Cost-Optimized Trajectory
-        else:
-            slice_size = min(remaining_quantity, ac_slice)
-            limit_p = snapshot.best_ask if side == OrderSide.BUY else snapshot.best_bid
-            sub_strat = "Almgren-Chriss Sliced"
-            reason = (
-                f"Moderate market risk ({risk_score:.2f}); executing AC optimal trajectory slice of "
-                f"{slice_size:.1f} units (expected cost ${expected_cost:.2f})."
-            )
-
-        slice_size = round(float(slice_size), 2)
-        if limit_p is not None:
-            limit_p = round(float(limit_p), 4)
-
-        return ExecutionDecision(
-            timestamp=snapshot.timestamp,
-            strategy=f"{self.name} [{sub_strat}]",
+        # CASE E — moderate toxicity: follow the AC inventory trajectory with a taker slice.
+        slice_size = min(remaining_quantity, ac_slice)
+        limit_p = snapshot.best_ask if side == OrderSide.BUY else snapshot.best_bid
+        reason = (
+            f"Passive toxicity risk is moderate at {risk_score:.2f}, between the "
+            f"{self.risk_low_thresh:.2f} and {self.risk_high_thresh:.2f} thresholds. "
+            f"Completion urgency is {urgency:.2f}, below the {self.urgency_high_thresh:.2f} aggressive threshold. "
+            f"Resulting mode: AGGRESSIVE. SmartFlow is following the Almgren-Chriss inventory trajectory "
+            f"with a scheduled taker slice of {slice_size:.1f} units (expected cost ${expected_cost:.2f}). "
+            f"This is execution-progress sizing, not a directional price forecast."
+        )
+        return self._build_decision(
+            snapshot=snapshot,
             side=side,
             quantity=slice_size,
             limit_price=limit_p,
             urgency=urgency,
             risk_score=risk_score,
+            remaining_quantity=remaining_quantity,
+            expected_cost=expected_cost,
+            execution_mode=ExecutionMode.AGGRESSIVE,
+            cancel_active_orders=True,
+            reason=reason,
+        )
+
+    def _build_decision(
+        self,
+        snapshot: MarketSnapshot,
+        side: OrderSide,
+        quantity: float,
+        limit_price: Optional[float],
+        urgency: float,
+        risk_score: float,
+        remaining_quantity: float,
+        expected_cost: float,
+        execution_mode: ExecutionMode,
+        cancel_active_orders: bool,
+        reason: str,
+    ) -> ExecutionDecision:
+        slice_size = round(float(quantity), 2)
+        if limit_price is not None:
+            limit_price = round(float(limit_price), 4)
+        return ExecutionDecision(
+            timestamp=snapshot.timestamp,
+            strategy=f"{self.name} [{execution_mode.value.upper()}]",
+            side=side,
+            quantity=slice_size,
+            limit_price=limit_price,
+            urgency=urgency,
+            risk_score=risk_score,
             reason=reason,
             remaining_quantity=remaining_quantity,
             expected_cost=expected_cost,
+            execution_mode=execution_mode,
+            cancel_active_orders=cancel_active_orders,
         )

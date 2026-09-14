@@ -1,9 +1,13 @@
 """
 Dynamic Execution Strategy Engine.
 The primary intelligence layer of the system:
-Continuously coordinates market microstructure features, ML adverse selection predictions,
-Almgren-Chriss cost estimates, and order progress to dynamically deploy optimal execution
-decisions with human-auditable reasoning.
+Continuously coordinates market microstructure features, ML adverse-selection
+(passive-exposure toxicity) predictions, Almgren-Chriss inventory schedules, and
+order-progress urgency to deploy execution decisions with human-auditable reasoning.
+
+Adverse-selection risk answers whether passive maker exposure is safe.
+Urgency and Almgren-Chriss answer how much must be executed and how soon.
+This layer does not treat toxicity probability as a directional price forecast.
 """
 
 from typing import Dict, Any, Optional, List

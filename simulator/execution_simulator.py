@@ -12,6 +12,7 @@ from data.contracts import (
     MarketSnapshot,
     OrderSide,
     OrderType,
+    ExecutionMode,
     ExecutionResult,
     ExecutionDecision,
     PredictionResult,
@@ -148,48 +149,21 @@ class ExecutionSimulator:
                     "mid_price": snap.mid_price,
                     "decision_strategy": decision.strategy,
                     "decision_quantity": decision.quantity,
+                    "execution_mode": decision.execution_mode.value,
+                    "cancel_active_orders": decision.cancel_active_orders,
                     "urgency": decision.urgency,
                     "risk_score": decision.risk_score,
                     "reason": decision.reason,
                 })
 
-                # If decision specifies action and order size > 0
-                if decision.quantity > 0:
-                    # Cancel existing stale active orders if aggressive or new slice
-                    if "aggressive" in decision.strategy.lower() or "market" in decision.strategy.lower():
-                        order_manager.cancel_all_active_orders(snap.timestamp)
-                        order_type = OrderType.MARKET
-                    else:
-                        order_type = OrderType.LIMIT
-
-                    new_ord = order_manager.create_order(
-                        timestamp=snap.timestamp,
-                        side=side,
-                        order_type=order_type,
-                        quantity=decision.quantity,
-                        price=decision.limit_price,
-                    )
-                    order_manager.submit_order(new_ord.order_id, snap.timestamp)
-
-                    # Immediate fill check for market or crossing orders
-                    if order_type == OrderType.MARKET or (
-                        decision.limit_price and (
-                            (side == OrderSide.BUY and decision.limit_price >= snap.best_ask) or
-                            (side == OrderSide.SELL and decision.limit_price <= snap.best_bid)
-                        )
-                    ):
-                        fill = self.fill_model.simulate_fill(new_ord, snap, adverse_risk=decision.risk_score)
-                        if fill:
-                            order_manager.record_fill(
-                                order_id=new_ord.order_id,
-                                timestamp=fill.timestamp,
-                                price=fill.price,
-                                quantity=fill.quantity,
-                                liquidity_type=fill.liquidity_type,
-                                slippage=fill.slippage,
-                            )
-                            remaining_qty = max(0.0, total_quantity - order_manager.total_filled_quantity)
-                            snap = self.ob_simulator.apply_fill_impact(snap, fill, side)
+                remaining_qty, snap = self.apply_execution_decision(
+                    decision=decision,
+                    order_manager=order_manager,
+                    snap=snap,
+                    side=side,
+                    remaining_qty=remaining_qty,
+                    total_quantity=total_quantity,
+                )
 
         # 3. Calculate finalized metrics
         fills = order_manager.get_fill_history()
@@ -242,3 +216,84 @@ class ExecutionSimulator:
             orders=orders,
             trajectory=trajectory,
         )
+
+    def apply_execution_decision(
+        self,
+        decision: ExecutionDecision,
+        order_manager: OrderManager,
+        snap: MarketSnapshot,
+        side: OrderSide,
+        remaining_qty: float,
+        total_quantity: float,
+    ):
+        """
+        Apply one execution decision against the live order manager.
+
+        Cancellations run before the quantity>0 check so HOLD/WITHDRAW can
+        pull existing resting maker orders even when no new size is submitted.
+        """
+        if decision.cancel_active_orders:
+            order_manager.cancel_all_active_orders(snap.timestamp)
+
+        if decision.execution_mode == ExecutionMode.HOLD:
+            return remaining_qty, snap
+
+        if decision.quantity <= 0:
+            return remaining_qty, snap
+
+        order_type = self.resolve_order_type(decision)
+        if order_type is None:
+            return remaining_qty, snap
+
+        # Legacy AUTO path: aggressive/market names still cancel restings.
+        if (
+            decision.execution_mode == ExecutionMode.AUTO
+            and order_type == OrderType.MARKET
+            and not decision.cancel_active_orders
+        ):
+            order_manager.cancel_all_active_orders(snap.timestamp)
+
+        new_ord = order_manager.create_order(
+            timestamp=snap.timestamp,
+            side=side,
+            order_type=order_type,
+            quantity=decision.quantity,
+            price=decision.limit_price,
+        )
+        order_manager.submit_order(new_ord.order_id, snap.timestamp)
+
+        if order_type == OrderType.MARKET or (
+            decision.limit_price and (
+                (side == OrderSide.BUY and decision.limit_price >= snap.best_ask) or
+                (side == OrderSide.SELL and decision.limit_price <= snap.best_bid)
+            )
+        ):
+            fill = self.fill_model.simulate_fill(new_ord, snap, adverse_risk=decision.risk_score)
+            if fill:
+                order_manager.record_fill(
+                    order_id=new_ord.order_id,
+                    timestamp=fill.timestamp,
+                    price=fill.price,
+                    quantity=fill.quantity,
+                    liquidity_type=fill.liquidity_type,
+                    slippage=fill.slippage,
+                )
+                remaining_qty = max(0.0, total_quantity - order_manager.total_filled_quantity)
+                snap = self.ob_simulator.apply_fill_impact(snap, fill, side)
+
+        return remaining_qty, snap
+
+    @staticmethod
+    def resolve_order_type(decision: ExecutionDecision) -> Optional[OrderType]:
+        """Map a typed execution mode to an order type. AUTO keeps legacy name inference."""
+        if decision.execution_mode == ExecutionMode.HOLD:
+            return None
+        if decision.execution_mode == ExecutionMode.PASSIVE:
+            return OrderType.LIMIT
+        if decision.execution_mode == ExecutionMode.AGGRESSIVE:
+            return OrderType.MARKET
+        # ExecutionMode.AUTO: backward compatible with TWAP/VWAP/AC/Market/etc.
+        if "aggressive" in decision.strategy.lower() or "market" in decision.strategy.lower():
+            return OrderType.MARKET
+        return OrderType.LIMIT
+
