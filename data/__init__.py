@@ -1,97 +1,133 @@
 """
-Data Package Public API.
+Public API for the SmartFlow data package.
 
-Provides the public data contracts, forecasting contracts, and feature-history
-interfaces used throughout the SmartFlow system.
+The ``data`` package provides the shared contracts and data-preparation
+interfaces used throughout SmartFlow.
 
-This package acts as the central import surface for shared data-layer objects.
-Keeping these exports here allows other modules to import commonly used data
-structures from ``data`` without depending on the internal organization of
-individual implementation modules.
+Public API Categories
+---------------------
 
-Public Components
------------------
-Contracts:
-    Core market, order, trade, execution, prediction, and backtest contracts.
+Core Contracts
+    Market snapshots, trades, orders, fills, execution decisions, execution
+    results, routing results, and backtest results.
 
-Forecasting:
-    ForecastInput and ForecastResult define the interface between the
-    chronological feature pipeline and the NVIDIA forecasting model.
+Forecasting Contracts
+    ForecastInput represents one model inference window.
+    ForecastResult represents one model forecast.
 
-Feature History:
-    FeatureHistoryBuilder and build_feature_history provide the Phase 2
-    pipeline for converting MarketSnapshot objects into a unified,
-    chronological feature DataFrame.
+Sequence Contracts
+    SequenceDataset represents the complete collection of rolling forecasting
+    windows produced from chronological feature history.
 
-Design Principles
------------------
-- Keep shared data contracts centralized.
-- Keep forecasting contracts separate from adverse-selection model contracts.
-- Preserve backward compatibility with existing imports.
-- Expose stable public interfaces while allowing internal implementation
-  details to evolve.
-- Avoid placing feature-extraction implementation directly in this module.
+Feature History
+    FeatureHistoryBuilder and build_feature_history convert MarketSnapshot
+    objects into a unified chronological feature DataFrame.
+
+Sequence Construction
+    SequenceBuilder and build_sequences convert chronological feature history
+    into fixed-length forecasting sequences.
+
+Architecture
+------------
+The intended forecasting data flow is:
+
+    MarketSnapshot
+        |
+        v
+    Feature Extraction
+        |
+        v
+    Feature History
+        |
+        v
+    SequenceDataset
+        |
+        v
+    ForecastInput
+        |
+        v
+    NVIDIA Forecasting Model
+        |
+        v
+    ForecastResult
+
+The package exports shared interfaces only. Feature-extraction and sequence
+construction implementations remain in their dedicated modules.
 """
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Core Data Contracts
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 from data.contracts import (
-    OrderSide,
-    OrderType,
-    OrderStatus,
-    LiquidityType,
-    RiskCategory,
+    # Enums
     ExecutionMode,
+    LiquidityType,
+    MarketRegime,
     ModelStatus,
-    Trade,
-    MarketSnapshot,
-    Order,
-    Fill,
-    PredictionResult,
-    ExecutionDecision,
-    ExecutionResult,
-    BacktestResult,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    RiskCategory,
+
+    # ML / model contracts
     ForecastInput,
     ForecastResult,
+    ModelSystemStatus,
+    PredictionResult,
+    SequenceDataset,
+
+    # Market contracts
+    MarketSnapshot,
+    Trade,
+
+    # Routing contracts
+    VenueQuote,
+    VenueRoutingResult,
+
+    # Order / execution contracts
+    Fill,
+    Order,
+    ExecutionDecision,
+    ExecutionResult,
+
+    # Backtesting contracts
+    BacktestResult,
 )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Feature History API
-# ---------------------------------------------------------------------------
-#
-# These imports are intentionally kept after the core contracts. The feature
-# history module depends on MarketSnapshot and therefore belongs conceptually
-# above the lower-level contract layer.
-#
-# The imports are wrapped in a guarded block so that the core data contracts
-# remain importable during incremental development if feature_history.py has
-# not yet been created.
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-try:
-    from data.feature_history import (
-        FeatureHistoryBuilder,
-        build_feature_history,
-    )
-
-    _FEATURE_HISTORY_EXPORTS = [
-        "FeatureHistoryBuilder",
-        "build_feature_history",
-    ]
-
-except ImportError:
-    _FEATURE_HISTORY_EXPORTS = []
+from data.feature_history import (
+    FeatureHistoryBuilder,
+    FeatureHistoryConfig,
+    build_feature_history,
+    get_feature_names,
+    get_required_columns,
+)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Sequence Construction API
+# ============================================================================
+
+from data.sequence_builder import (
+    SequenceBuilder,
+    SequenceBuilderConfig,
+    build_sequences,
+)
+
+
+# ============================================================================
 # Public Package API
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 __all__ = [
+    # ------------------------------------------------------------------------
     # Core enums
+    # ------------------------------------------------------------------------
     "OrderSide",
     "OrderType",
     "OrderStatus",
@@ -99,24 +135,56 @@ __all__ = [
     "RiskCategory",
     "ExecutionMode",
     "ModelStatus",
+    "MarketRegime",
 
-    # Core market and trading contracts
-    "Trade",
-    "MarketSnapshot",
-    "Order",
-    "Fill",
-
-    # Existing prediction and execution contracts
+    # ------------------------------------------------------------------------
+    # Model / ML contracts
+    # ------------------------------------------------------------------------
+    "ModelSystemStatus",
     "PredictionResult",
-    "ExecutionDecision",
-    "ExecutionResult",
-    "BacktestResult",
-
-    # NVIDIA forecasting contracts
     "ForecastInput",
     "ForecastResult",
+    "SequenceDataset",
 
+    # ------------------------------------------------------------------------
+    # Market contracts
+    # ------------------------------------------------------------------------
+    "Trade",
+    "MarketSnapshot",
+
+    # ------------------------------------------------------------------------
+    # Order / execution contracts
+    # ------------------------------------------------------------------------
+    "Order",
+    "Fill",
+    "ExecutionDecision",
+    "ExecutionResult",
+
+    # ------------------------------------------------------------------------
+    # Routing contracts
+    # ------------------------------------------------------------------------
+    "VenueQuote",
+    "VenueRoutingResult",
+
+    # ------------------------------------------------------------------------
+    # Backtesting contracts
+    # ------------------------------------------------------------------------
+    "BacktestResult",
+
+    # ------------------------------------------------------------------------
     # Phase 2 feature-history API
-    *_FEATURE_HISTORY_EXPORTS,
+    # ------------------------------------------------------------------------
+    "FeatureHistoryConfig",
+    "FeatureHistoryBuilder",
+    "build_feature_history",
+    "get_feature_names",
+    "get_required_columns",
+
+    # ------------------------------------------------------------------------
+    # Phase 3 sequence-construction API
+    # ------------------------------------------------------------------------
+    "SequenceBuilderConfig",
+    "SequenceBuilder",
+    "build_sequences",
 ]
 
