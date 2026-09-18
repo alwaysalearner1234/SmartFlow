@@ -1,25 +1,43 @@
 """
 Centralized Configuration Module for Smart Order Routing & Risk-Aware Trade Execution.
+
 Maintains typed configuration dataclasses for market simulation, feature engineering,
-ML model training, Almgren-Chriss parameters, execution strategy logic, and experimental scenarios.
+ML model training, NVIDIA forecasting, Almgren-Chriss parameters, execution
+strategy logic, and experimental scenarios.
+
+Forecasting configuration is intentionally separated from the existing adverse-
+selection model configuration. The adverse-selection model predicts passive
+execution risk, while the forecasting model predicts short-term directional
+market movement.
 """
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from pathlib import Path
 
+
+# ============================================================================
 # Paths
+# ============================================================================
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 DATA_DIR = BASE_DIR / "data"
 RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
+
 MODELS_DIR = BASE_DIR / "models"
 SAVED_MODELS_DIR = MODELS_DIR / "saved"
 
 
+# ============================================================================
+# Market Configuration
+# ============================================================================
+
 @dataclass(frozen=True)
 class MarketConfig:
     """Market microstructure configuration parameters."""
+
     symbol: str = "BTC-USD"
     tick_size: float = 0.01
     lot_size: float = 0.001
@@ -31,78 +49,256 @@ class MarketConfig:
     random_seed: int = 42
 
 
+# ============================================================================
+# Feature Engineering Configuration
+# ============================================================================
+
 @dataclass(frozen=True)
 class FeatureConfig:
     """Microstructure feature engineering parameters."""
-    momentum_windows: List[int] = field(default_factory=lambda: [5, 10, 20, 50])
-    volatility_windows: List[int] = field(default_factory=lambda: [10, 30, 60])
-    trade_flow_windows: List[int] = field(default_factory=lambda: [5, 15, 30])
+
+    momentum_windows: List[int] = field(
+        default_factory=lambda: [5, 10, 20, 50]
+    )
+
+    volatility_windows: List[int] = field(
+        default_factory=lambda: [10, 30, 60]
+    )
+
+    trade_flow_windows: List[int] = field(
+        default_factory=lambda: [5, 15, 30]
+    )
+
     ofi_levels: int = 5
     imbalance_decay: float = 0.9
 
 
+# ============================================================================
+# Adverse-Selection Model Configuration
+# ============================================================================
+
 @dataclass(frozen=True)
 class ModelConfig:
-    """ML Adverse-Selection Model parameters."""
-    prediction_horizon: int = 10  # Ticks ahead to predict adverse movement
-    adverse_threshold_spread_mult: float = 0.5  # Delta mid-price > mult * spread triggers adverse label
+    """
+    ML Adverse-Selection Model parameters.
+
+    This configuration applies to the existing model that estimates the risk
+    of passive orders being adversely selected.
+    """
+
+    prediction_horizon: int = 10
+    adverse_threshold_spread_mult: float = 0.5
+
     test_size: float = 0.15
     val_size: float = 0.15
+
     random_seed: int = 42
+
     xgboost_n_estimators: int = 150
     xgboost_max_depth: int = 4
     xgboost_learning_rate: float = 0.05
-    logreg_c: float = 1.0
-    saved_model_path: Path = SAVED_MODELS_DIR / "best_adverse_selection_model.joblib"
 
+    logreg_c: float = 1.0
+
+    saved_model_path: Path = (
+        SAVED_MODELS_DIR / "best_adverse_selection_model.joblib"
+    )
+
+
+# ============================================================================
+# NVIDIA Forecasting Configuration
+# ============================================================================
+
+@dataclass(frozen=True)
+class ForecastingConfig:
+    """
+    Configuration for the NVIDIA short-term market forecasting pipeline.
+
+    The forecasting pipeline converts chronological engineered market features
+    into rolling sequences suitable for the NVIDIA forecasting model.
+
+    The initial design uses:
+
+        context_window = 20 observations
+        forecast_horizon = 5 observations
+
+    The target is the future cumulative mid-price return:
+
+        (future_mid_price - current_mid_price) / current_mid_price
+
+    All forecasting configuration is kept separate from ModelConfig because
+    the forecasting model and adverse-selection model solve different tasks.
+    """
+
+    # ------------------------------------------------------------------------
+    # Forecasting feature contract
+    # ------------------------------------------------------------------------
+
+    feature_names: List[str] = field(
+        default_factory=lambda: [
+            "mid_price_return",
+            "spread_bps",
+            "best_bid_size",
+            "best_ask_size",
+            "depth_imbalance_l1",
+            "depth_imbalance_multilevel",
+            "ofi_instant",
+            "ofi_sum_5",
+            "trade_volume_imbalance",
+            "momentum_ret_5",
+            "momentum_ret_20",
+            "volatility_std_10",
+            "micro_price",
+            "micro_price_divergence",
+        ]
+    )
+
+    # ------------------------------------------------------------------------
+    # Sequence configuration
+    # ------------------------------------------------------------------------
+
+    context_window: int = 20
+    forecast_horizon: int = 5
+
+    # ------------------------------------------------------------------------
+    # Forecast target configuration
+    # ------------------------------------------------------------------------
+
+    target_column: str = "future_mid_price_return"
+
+    target_price_column: str = "mid_price"
+
+    # ------------------------------------------------------------------------
+    # Chronological validation configuration
+    # ------------------------------------------------------------------------
+
+    test_size: float = 0.15
+    val_size: float = 0.15
+
+    # ------------------------------------------------------------------------
+    # Normalization configuration
+    # ------------------------------------------------------------------------
+
+    normalization_method: str = "standard"
+
+    normalize_features: bool = True
+
+    scaler_fit_on_training_only: bool = True
+
+    # ------------------------------------------------------------------------
+    # Data-quality configuration
+    # ------------------------------------------------------------------------
+
+    allow_missing_values: bool = False
+
+    drop_invalid_sequences: bool = True
+
+    require_chronological_order: bool = True
+
+    # ------------------------------------------------------------------------
+    # Reproducibility
+    # ------------------------------------------------------------------------
+
+    random_seed: int = 42
+
+
+# ============================================================================
+# Almgren-Chriss Configuration
+# ============================================================================
 
 @dataclass(frozen=True)
 class AlmgrenChrissConfig:
     """Almgren-Chriss optimal execution model parameters."""
-    risk_aversion: float = 1e-4      # lambda: trader's risk aversion
-    temporary_impact: float = 2.5e-4 # eta: temporary impact parameter
-    permanent_impact: float = 2.5e-5 # gamma: permanent impact parameter
-    volatility: float = 0.30         # sigma: annual/tick volatility
-    default_horizon_sec: float = 60.0# T: execution horizon in seconds
-    default_slices: int = 12         # N: number of discrete trade slices
 
+    risk_aversion: float = 1e-4
+    temporary_impact: float = 2.5e-4
+    permanent_impact: float = 2.5e-5
+    volatility: float = 0.30
+
+    default_horizon_sec: float = 60.0
+    default_slices: int = 12
+
+
+# ============================================================================
+# Execution Configuration
+# ============================================================================
 
 @dataclass(frozen=True)
 class ExecutionConfig:
     """Dynamic strategy engine thresholds."""
-    risk_low_threshold: float = 0.35   # Below this, passive maker exposure is considered relatively safe
-    risk_high_threshold: float = 0.65  # Above this, passive maker exposure is considered toxic and should be suppressed
-    urgency_low_threshold: float = 0.3
-    urgency_high_threshold: float = 0.75  # Above this, completion pressure may force aggressive execution even if passive risk is high
-    passive_price_offset_ticks: int = 0 # Post at best quote
-    max_participation_rate: float = 0.20 # Max % of visible top level volume per order
 
+    risk_low_threshold: float = 0.35
+    risk_high_threshold: float = 0.65
+
+    urgency_low_threshold: float = 0.3
+    urgency_high_threshold: float = 0.75
+
+    passive_price_offset_ticks: int = 0
+    max_participation_rate: float = 0.20
+
+
+# ============================================================================
+# Simulation Configuration
+# ============================================================================
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    """Market & execution simulation parameters."""
-    execution_delay_ms: float = 15.0  # Latency between decision and market arrival
-    queue_impact_factor: float = 0.5   # Probability decay of queue priority
-    adverse_fill_bias: float = 0.3     # Higher chance of being picked off during adverse moves
+    """Market and execution simulation parameters."""
+
+    execution_delay_ms: float = 15.0
+    queue_impact_factor: float = 0.5
+    adverse_fill_bias: float = 0.3
     random_seed: int = 42
 
+
+# ============================================================================
+# Unified System Configuration
+# ============================================================================
 
 @dataclass
 class SystemConfig:
     """Unified system configuration object."""
-    market: MarketConfig = field(default_factory=MarketConfig)
-    features: FeatureConfig = field(default_factory=FeatureConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    almgren_chriss: AlmgrenChrissConfig = field(default_factory=AlmgrenChrissConfig)
-    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
-    simulation: SimulationConfig = field(default_factory=SimulationConfig)
+
+    market: MarketConfig = field(
+        default_factory=MarketConfig
+    )
+
+    features: FeatureConfig = field(
+        default_factory=FeatureConfig
+    )
+
+    model: ModelConfig = field(
+        default_factory=ModelConfig
+    )
+
+    forecasting: ForecastingConfig = field(
+        default_factory=ForecastingConfig
+    )
+
+    almgren_chriss: AlmgrenChrissConfig = field(
+        default_factory=AlmgrenChrissConfig
+    )
+
+    execution: ExecutionConfig = field(
+        default_factory=ExecutionConfig
+    )
+
+    simulation: SimulationConfig = field(
+        default_factory=SimulationConfig
+    )
 
 
-# 10 Standard Experimental Scenarios
+# ============================================================================
+# Experimental Scenarios
+# ============================================================================
+
 SCENARIOS: Dict[str, Dict[str, Any]] = {
+
     "normal_market": {
         "name": "Normal Market",
-        "description": "Baseline liquidity, balanced order flow, standard volatility",
+        "description": (
+            "Baseline liquidity, balanced order flow, standard volatility"
+        ),
         "volatility": 0.20,
         "spread_mult": 1.0,
         "depth_mult": 1.0,
@@ -110,9 +306,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": 0.0,
     },
+
     "high_volatility": {
         "name": "High Volatility",
-        "description": "Elevated price jumps, rapid spread expansion, wider uncertainty",
+        "description": (
+            "Elevated price jumps, rapid spread expansion, wider uncertainty"
+        ),
         "volatility": 0.60,
         "spread_mult": 2.2,
         "depth_mult": 0.8,
@@ -120,9 +319,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": 0.1,
     },
+
     "poor_liquidity": {
         "name": "Poor Liquidity / Thin Book",
-        "description": "Shallow depth, wide spreads, severe price impact",
+        "description": (
+            "Shallow depth, wide spreads, severe price impact"
+        ),
         "volatility": 0.30,
         "spread_mult": 3.0,
         "depth_mult": 0.25,
@@ -130,9 +332,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": 0.1,
     },
+
     "high_adverse_selection": {
         "name": "High Adverse Selection Risk",
-        "description": "Toxic directional flow, resting limit orders frequently picked off",
+        "description": (
+            "Toxic directional flow, resting limit orders frequently picked off"
+        ),
         "volatility": 0.35,
         "spread_mult": 1.2,
         "depth_mult": 0.9,
@@ -140,9 +345,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": 0.8,
     },
+
     "low_adverse_selection": {
         "name": "Low Adverse Selection Risk",
-        "description": "Mean-reverting, noise-driven liquidity with minimal informed flow",
+        "description": (
+            "Mean-reverting, noise-driven liquidity with minimal informed flow"
+        ),
         "volatility": 0.15,
         "spread_mult": 0.8,
         "depth_mult": 1.5,
@@ -150,9 +358,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": -0.5,
     },
+
     "small_order": {
         "name": "Small Order (Low Market Impact)",
-        "description": "Parent order is < 1% of average top-level liquidity",
+        "description": (
+            "Parent order is < 1% of average top-level liquidity"
+        ),
         "volatility": 0.20,
         "spread_mult": 1.0,
         "depth_mult": 1.0,
@@ -160,9 +371,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": 0.0,
     },
+
     "medium_order": {
         "name": "Medium Order (Standard)",
-        "description": "Parent order matches ~10% of visible depth",
+        "description": (
+            "Parent order matches ~10% of visible depth"
+        ),
         "volatility": 0.20,
         "spread_mult": 1.0,
         "depth_mult": 1.0,
@@ -170,9 +384,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 60.0,
         "adverse_intensity": 0.0,
     },
+
     "large_order": {
         "name": "Large Order (Severe Impact)",
-        "description": "Parent order exceeds instantaneous book depth, requiring slicing",
+        "description": (
+            "Parent order exceeds instantaneous book depth, requiring slicing"
+        ),
         "volatility": 0.25,
         "spread_mult": 1.2,
         "depth_mult": 0.7,
@@ -180,9 +397,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 90.0,
         "adverse_intensity": 0.2,
     },
+
     "short_execution_horizon": {
         "name": "Short Execution Horizon (High Urgency)",
-        "description": "Limited time to execute, high risk of penalty or market sweep",
+        "description": (
+            "Limited time to execute, high risk of penalty or market sweep"
+        ),
         "volatility": 0.25,
         "spread_mult": 1.0,
         "depth_mult": 1.0,
@@ -190,9 +410,12 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "horizon_sec": 20.0,
         "adverse_intensity": 0.1,
     },
+
     "long_execution_horizon": {
         "name": "Long Execution Horizon (Patient)",
-        "description": "Extended time window allowing patient passive quoting",
+        "description": (
+            "Extended time window allowing patient passive quoting"
+        ),
         "volatility": 0.20,
         "spread_mult": 1.0,
         "depth_mult": 1.2,
@@ -202,5 +425,9 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Global default config instance
+
+# ============================================================================
+# Global Default Configuration
+# ============================================================================
+
 DEFAULT_CONFIG = SystemConfig()
