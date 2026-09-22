@@ -5,7 +5,7 @@ This module defines the strongly typed data structures shared across the
 SmartFlow market-data, feature-engineering, forecasting, execution,
 simulation, and backtesting layers.
 
-The contracts are intentionally kept independent from implementation logic.
+The contracts are intentionally independent from implementation logic.
 They provide stable interfaces between components while allowing individual
 modules to evolve internally.
 
@@ -31,11 +31,14 @@ Routing contracts:
     VenueQuote
     VenueRoutingResult
 
-Backtesting contracts:
-    BacktestResult
-
 Sequence-data contracts:
     SequenceDataset
+
+Target-data contracts:
+    TargetDataset
+
+Backtesting contracts:
+    BacktestResult
 
 Forecasting Architecture
 ------------------------
@@ -60,17 +63,39 @@ The forecasting data pipeline is:
         v
     Chronological Feature History
         |
-        v
-    SequenceDataset
-        |
-        v
-    ForecastInput
-        |
-        v
-    NVIDIA Forecasting Model
-        |
-        v
-    ForecastResult
+        +--------------------------+
+        |                          |
+        v                          v
+    SequenceDataset           TargetDataset
+        |                          |
+        +------------+-------------+
+                     |
+                     v
+       Aligned Forecasting Dataset
+                     |
+                     v
+              ForecastInput
+                     |
+                     v
+          NVIDIA Forecasting Model
+                     |
+                     v
+              ForecastResult
+
+Target Definition
+-----------------
+The initial forecasting target is the forward cumulative mid-price return:
+
+    (mid_price[t + forecast_horizon] - mid_price[t])
+    / mid_price[t]
+
+For the current SmartFlow configuration:
+
+    context_window = 20 observations
+    forecast_horizon = 5 observations
+
+The final forecast_horizon observations cannot produce valid future-return
+targets because the required future prices are unavailable.
 
 Design Principles
 -----------------
@@ -80,10 +105,15 @@ Design Principles
 - Keep adverse-selection prediction separate from directional forecasting.
 - Preserve compatibility with the existing SmartFlow architecture.
 - Avoid embedding model, execution, or simulator logic in contracts.
+- Prefer explicit validation messages that are useful during development.
+- Preserve chronological ordering throughout the forecasting pipeline.
+- Prevent ambiguous alignment between sequences, targets, and timestamps.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
+from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -163,6 +193,102 @@ class MarketRegime(str, Enum):
 
 
 # ============================================================================
+# Shared Validation Helpers
+# ============================================================================
+
+
+def _is_numeric(value: Any) -> bool:
+    """
+    Return whether a value is a real numeric value.
+
+    Booleans are intentionally excluded because bool is a subclass of int
+    in Python but should not represent prices, timestamps, quantities, or
+    model outputs in SmartFlow contracts.
+    """
+
+    return isinstance(value, Real) and not isinstance(value, bool)
+
+
+def _is_finite_numeric(value: Any) -> bool:
+    """Return whether a value is numeric and finite."""
+
+    return _is_numeric(value) and isfinite(float(value))
+
+
+def _validate_timestamp_sequence(
+    timestamps: List[float],
+    *,
+    field_name: str,
+    require_non_empty: bool = True,
+) -> None:
+    """
+    Validate a timestamp sequence used by forecasting or market contracts.
+
+    Validation includes:
+
+    - list-like non-empty structure when required
+    - numeric timestamps
+    - finite timestamps
+    - chronological ordering
+    - uniqueness
+    """
+
+    if timestamps is None:
+        raise ValueError(
+            f"{field_name} cannot be None."
+        )
+
+    if require_non_empty and len(timestamps) == 0:
+        raise ValueError(
+            f"{field_name} cannot be empty."
+        )
+
+    for timestamp in timestamps:
+        if not _is_finite_numeric(timestamp):
+            raise ValueError(
+                f"{field_name} must contain only finite numeric values."
+            )
+
+    if any(
+        timestamps[index] > timestamps[index + 1]
+        for index in range(len(timestamps) - 1)
+    ):
+        raise ValueError(
+            f"{field_name} must be in chronological order."
+        )
+
+    if len(set(timestamps)) != len(timestamps):
+        raise ValueError(
+            f"{field_name} must contain unique timestamps."
+        )
+
+
+def _validate_numeric_values(
+    values: Any,
+    *,
+    field_name: str,
+    require_non_empty: bool = True,
+) -> None:
+    """Validate that a collection contains finite numeric values."""
+
+    if values is None:
+        raise ValueError(
+            f"{field_name} cannot be None."
+        )
+
+    if require_non_empty and len(values) == 0:
+        raise ValueError(
+            f"{field_name} cannot be empty."
+        )
+
+    for value in values:
+        if not _is_finite_numeric(value):
+            raise ValueError(
+                f"{field_name} must contain only finite numeric values."
+            )
+
+
+# ============================================================================
 # ML / Model Contracts
 # ============================================================================
 
@@ -172,8 +298,8 @@ class ModelSystemStatus:
     """
     Standardized single source of truth for ML model status.
 
-    This contract is used to communicate whether a model is loaded and
-    whether predictions are currently available, without exposing model
+    This contract communicates whether a model is loaded and whether
+    predictions are currently available without exposing model
     implementation details to downstream components.
     """
 
@@ -195,8 +321,7 @@ class ForecastInput:
 
     A ForecastInput represents exactly one chronological context window.
 
-    The expected initial feature set contains 14 market microstructure and
-    short-term price features:
+    Expected initial feature set:
 
         mid_price_return
         spread_bps
@@ -213,25 +338,16 @@ class ForecastInput:
         micro_price
         micro_price_divergence
 
-    Data Shape
-    ----------
-    feature_sequence:
-        A two-dimensional sequence represented as:
+    Expected current data shape:
 
-            [context_window][feature_count]
+        [context_window][feature_count]
 
-        For the current SmartFlow configuration:
+    For the initial SmartFlow configuration:
 
-            [20][14]
+        [20][14]
 
-    timestamps:
-        One timestamp for each observation in the context window.
-
-    Important
-    ---------
     The sequence must contain only information available at or before its
-    final observation timestamp. Future observations must never be inserted
-    into feature_sequence.
+    final observation timestamp.
     """
 
     feature_sequence: List[List[float]]
@@ -273,12 +389,20 @@ class ForecastInput:
                 "feature_names cannot be empty."
             )
 
-        feature_count = len(self.feature_names)
+        if any(
+            not isinstance(name, str) or not name.strip()
+            for name in self.feature_names
+        ):
+            raise ValueError(
+                "feature_names must contain non-empty strings."
+            )
 
-        if len(set(self.feature_names)) != feature_count:
+        if len(set(self.feature_names)) != len(self.feature_names):
             raise ValueError(
                 "feature_names must not contain duplicate names."
             )
+
+        feature_count = len(self.feature_names)
 
         for row in self.feature_sequence:
             if len(row) != feature_count:
@@ -287,34 +411,21 @@ class ForecastInput:
                     "for each feature name."
                 )
 
-        if any(
-            self.timestamps[index] > self.timestamps[index + 1]
-            for index in range(len(self.timestamps) - 1)
-        ):
-            raise ValueError(
-                "Forecasting timestamps must be in chronological order."
+            _validate_numeric_values(
+                row,
+                field_name="feature_sequence row",
             )
 
-        if len(set(self.timestamps)) != len(self.timestamps):
-            raise ValueError(
-                "Forecasting timestamps must be unique."
-            )
-
-        for timestamp in self.timestamps:
-            if not isinstance(timestamp, (int, float)):
-                raise TypeError(
-                    "Forecasting timestamps must be numeric."
-                )
+        _validate_timestamp_sequence(
+            self.timestamps,
+            field_name="Forecasting timestamps",
+        )
 
 
 @dataclass
 class SequenceDataset:
     """
     Contract representing a collection of rolling forecasting sequences.
-
-    Unlike ForecastInput, which represents one inference window,
-    SequenceDataset represents the complete set of windows produced from a
-    chronological feature history.
 
     Expected current shape:
 
@@ -329,7 +440,7 @@ class SequenceDataset:
     The sequence timestamps identify the observation timestamps belonging to
     each rolling window.
 
-    This contract intentionally does not contain forecasting targets yet.
+    This contract intentionally does not contain forecasting targets.
     Target construction belongs to Phase 4. Keeping targets separate here
     prevents sequence construction from accidentally introducing future
     information into the input-generation layer.
@@ -351,6 +462,14 @@ class SequenceDataset:
         if not self.feature_names:
             raise ValueError(
                 "feature_names cannot be empty."
+            )
+
+        if any(
+            not isinstance(name, str) or not name.strip()
+            for name in self.feature_names
+        ):
+            raise ValueError(
+                "feature_names must contain non-empty strings."
             )
 
         if len(set(self.feature_names)) != len(self.feature_names):
@@ -399,19 +518,10 @@ class SequenceDataset:
                     "timestamps."
                 )
 
-            if any(
-                sequence_timestamps[index]
-                > sequence_timestamps[index + 1]
-                for index in range(len(sequence_timestamps) - 1)
-            ):
-                raise ValueError(
-                    "Each sequence's timestamps must be chronological."
-                )
-
-            if len(set(sequence_timestamps)) != len(sequence_timestamps):
-                raise ValueError(
-                    "Timestamps within a sequence must be unique."
-                )
+            _validate_timestamp_sequence(
+                sequence_timestamps,
+                field_name="Sequence timestamps",
+            )
 
     @property
     def num_sequences(self) -> int:
@@ -430,6 +540,127 @@ class SequenceDataset:
         """Return the complete sequence-dataset shape."""
 
         return tuple(self.sequences.shape)
+
+
+@dataclass
+class TargetDataset:
+    """
+    Contract representing future-return targets for forecasting.
+
+    Each target corresponds to a current observation timestamp and measures
+    the forward mid-price return over the configured forecast horizon.
+
+    Target formula:
+
+        (mid_price[t + forecast_horizon] - mid_price[t])
+        / mid_price[t]
+
+    Example:
+
+        forecast_horizon = 5
+
+        target[t] =
+            (mid_price[t + 5] - mid_price[t])
+            / mid_price[t]
+
+    The final forecast_horizon observations cannot produce valid targets
+    because their future prices are unavailable.
+
+    Attributes
+    ----------
+    targets:
+        One-dimensional collection of future-return target values.
+
+    timestamps:
+        Current-observation timestamps associated with each target.
+
+    target_name:
+        Canonical target identifier, initially
+        "future_mid_price_return".
+
+    forecast_horizon:
+        Number of observations into the future used to calculate the target.
+
+    price_column:
+        Source price column used to calculate the target, initially
+        "mid_price".
+    """
+
+    targets: Any
+    timestamps: List[float]
+    target_name: str
+    forecast_horizon: int
+    price_column: str = "mid_price"
+
+    def __post_init__(self) -> None:
+        """Validate the structural integrity of the target dataset."""
+
+        if self.forecast_horizon <= 0:
+            raise ValueError(
+                "forecast_horizon must be greater than zero."
+            )
+
+        if not isinstance(self.target_name, str):
+            raise TypeError(
+                "target_name must be a string."
+            )
+
+        if not self.target_name.strip():
+            raise ValueError(
+                "target_name cannot be empty."
+            )
+
+        if not isinstance(self.price_column, str):
+            raise TypeError(
+                "price_column must be a string."
+            )
+
+        if not self.price_column.strip():
+            raise ValueError(
+                "price_column cannot be empty."
+            )
+
+        if self.targets is None:
+            raise ValueError(
+                "targets cannot be None."
+            )
+
+        if not hasattr(self.targets, "__len__"):
+            raise TypeError(
+                "targets must be a sized numerical collection."
+            )
+
+        if len(self.targets) == 0:
+            raise ValueError(
+                "targets cannot be empty."
+            )
+
+        if len(self.targets) != len(self.timestamps):
+            raise ValueError(
+                "targets and timestamps must have matching lengths."
+            )
+
+        _validate_timestamp_sequence(
+            self.timestamps,
+            field_name="Target timestamps",
+        )
+
+        _validate_numeric_values(
+            self.targets,
+            field_name="Target values",
+        )
+
+    @property
+    def num_targets(self) -> int:
+        """Return the number of generated targets."""
+
+        return len(self.targets)
+
+    @property
+    def target_values(self) -> Any:
+        """Return the underlying target values."""
+
+        return self.targets
 
 
 @dataclass
@@ -466,12 +697,27 @@ class ForecastResult:
     def __post_init__(self) -> None:
         """Validate and derive basic forecast information."""
 
+        if not _is_finite_numeric(self.timestamp):
+            raise ValueError(
+                "timestamp must be a finite numeric value."
+            )
+
         if self.forecast_horizon <= 0:
             raise ValueError(
                 "forecast_horizon must be greater than zero."
             )
 
+        if not _is_finite_numeric(self.predicted_return):
+            raise ValueError(
+                "predicted_return must be a finite numeric value."
+            )
+
         if self.confidence is not None:
+            if not _is_finite_numeric(self.confidence):
+                raise ValueError(
+                    "confidence must be a finite numeric value."
+                )
+
             if not 0.0 <= self.confidence <= 1.0:
                 raise ValueError(
                     "confidence must be between 0.0 and 1.0."
@@ -487,6 +733,11 @@ class ForecastResult:
 
         if self.expected_move_bps is None:
             self.expected_move_bps = self.predicted_return * 10_000
+
+        if not _is_finite_numeric(self.expected_move_bps):
+            raise ValueError(
+                "expected_move_bps must be a finite numeric value."
+            )
 
 
 @dataclass

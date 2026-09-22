@@ -440,7 +440,9 @@ class SequenceBuilder:
         if not self.config.allow_infinite_values:
             numeric_values = feature_frame.to_numpy(dtype=float)
 
-            if not np.isfinite(numeric_values).all():
+            infinite_mask = np.isinf(numeric_values)
+
+            if infinite_mask.any():
                 raise ValueError(
                     "Feature history contains infinite feature values."
                 )

@@ -513,13 +513,15 @@ def test_non_numeric_timestamp_is_rejected() -> None:
 
     frame = make_feature_history(25)
 
+    frame["timestamp"] = frame["timestamp"].astype(object)
     frame.loc[5, "timestamp"] = "invalid"
 
     with pytest.raises(
         ValueError,
-        match="timestamps must be numeric",
+        match="timestamps must be numeric and finite",
     ):
         SequenceBuilder().build(frame)
+
 
 
 def test_infinite_timestamp_is_rejected() -> None:
@@ -560,13 +562,14 @@ def test_non_numeric_feature_value_is_rejected() -> None:
 
     frame = make_feature_history(25)
 
-    frame.loc[5, NVIDIA_FEATURES[0]] = "invalid"
+    feature_name = NVIDIA_FEATURES[0]
 
-    with pytest.raises(
-        ValueError,
-        match="missing or non-numeric values",
-    ):
+    frame[feature_name] = frame[feature_name].astype(object)
+    frame.loc[5, feature_name] = "invalid"
+
+    with pytest.raises(ValueError, match="missing or non-numeric"):
         SequenceBuilder().build(frame)
+
 
 
 def test_infinite_feature_value_is_rejected() -> None:

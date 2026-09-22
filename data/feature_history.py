@@ -737,6 +737,29 @@ def build_feature_history(
         snapshots
     )
 
+def get_feature_names() -> list[str]:
+    """
+    Return the feature names used by the NVIDIA forecasting pipeline.
+
+    Returns
+    -------
+    list[str]
+        Ordered list of NVIDIA forecasting feature names.
+    """
+    return list(NVIDIA_FEATURES)
+
+
+def get_required_columns() -> list[str]:
+    """
+    Return the columns required to construct a valid feature history.
+
+    Returns
+    -------
+    list[str]
+        Ordered list containing timestamp, mid_price, and all
+        NVIDIA forecasting features.
+    """
+    return list(REQUIRED_HISTORY_COLUMNS)
 
 # ---------------------------------------------------------------------------
 # Module Public API
