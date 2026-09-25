@@ -268,6 +268,6 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-## 15. React Frontend (Phase 1)
+## 15. React Frontend
 
-An alternative React + Plotly frontend skeleton and its proposed data contract live in [frontend/](frontend/README.md). The Streamlit dashboard above is the currently integrated UI. The React frontend requires a FastAPI endpoint before it can display backend data; see its README for the outstanding integration decisions.
+The React + Plotly frontend and its data contract live in [frontend/](frontend/README.md). It reads market, feature-history, execution, and performance data from the FastAPI service in `api/`. The Streamlit dashboard above remains a functional reference. See the frontend README for startup commands and the remaining risk-data contract.

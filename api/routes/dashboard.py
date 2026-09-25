@@ -21,6 +21,8 @@ from api.schemas import (
     DashboardSnapshot,
     MarketState,
     BookLevel,
+    FeaturePoint,
+    FeatureState,
     ExecutionState,
     ExecutionPoint,
     RiskState,
@@ -55,6 +57,14 @@ def _map_action(strategy_text: str, quantity: float = 1.0) -> Action:
     if "aggressive" in s or "market" in s:
         return "aggressive"
     return "passive"
+
+
+def _finite_metric(value: Any) -> Optional[float]:
+    """Keep unavailable feature values as null instead of inventing zeroes."""
+    if value is None:
+        return None
+    number = float(value)
+    return number if np.isfinite(number) else None
 
 
 class DashboardDataService:
@@ -100,7 +110,9 @@ class DashboardDataService:
             BookLevel(price=round(p, 2), quantity=round(s, 2))
             for p, s in sorted(latest_snap.asks, key=lambda x: x[0])[:5]
         ]
-        ofi = float(np.clip(latest_feats.get("order_flow_imbalance", latest_feats.get("depth_imbalance_l1", 0.0)), -1.0, 1.0))
+        # The Phase 1 field name is retained for compatibility. Its bounded
+        # value is L1 depth imbalance; raw order-flow imbalance is in features.
+        ofi = float(np.clip(latest_feats.get("depth_imbalance_l1", 0.0), -1.0, 1.0))
 
         market_state = MarketState(
             timestamp=_format_iso(latest_snap.timestamp),
@@ -110,6 +122,22 @@ class DashboardDataService:
             mid_price=round(latest_snap.mid_price, 2),
             spread=round(latest_snap.spread, 2),
             order_flow_imbalance=round(ofi, 4),
+        )
+
+        feature_state = FeatureState(
+            points=[
+                FeaturePoint(
+                    timestamp=_format_iso(float(row["timestamp"])),
+                    spread_bps=_finite_metric(row.get("spread_bps")),
+                    depth_imbalance_l1=_finite_metric(row.get("depth_imbalance_l1")),
+                    ofi_instant=_finite_metric(row.get("ofi_instant")),
+                    volatility_std_10=_finite_metric(row.get("volatility_std_10")),
+                    momentum_ret_5=_finite_metric(row.get("momentum_ret_5")),
+                    total_bid_depth=float(row["total_bid_depth"]),
+                    total_ask_depth=float(row["total_ask_depth"]),
+                )
+                for row in df_features.tail(80).to_dict(orient="records")
+            ]
         )
 
         # 2. Risk State
@@ -221,6 +249,7 @@ class DashboardDataService:
         snapshot = DashboardSnapshot(
             schema_version="1.0",
             market=market_state,
+            features=feature_state,
             execution=execution_state,
             risk=risk_state,
             performance=perf_state,

@@ -26,6 +26,23 @@ class MarketState(BaseModel):
     order_flow_imbalance: float
 
 
+class FeaturePoint(BaseModel):
+    """One chronological market-feature observation for Phase 3 charts."""
+
+    timestamp: str  # UTC ISO 8601
+    spread_bps: Optional[float] = None
+    depth_imbalance_l1: Optional[float] = None  # [-1, 1]
+    ofi_instant: Optional[float] = None  # signed quantity, not a normalized ratio
+    volatility_std_10: Optional[float] = None  # standard deviation of log returns
+    momentum_ret_5: Optional[float] = None  # five-tick simple return
+    total_bid_depth: float
+    total_ask_depth: float
+
+
+class FeatureState(BaseModel):
+    points: List[FeaturePoint]
+
+
 class ExecutionPoint(BaseModel):
     timestamp: str
     remaining_quantity: float
@@ -75,6 +92,7 @@ class PerformanceState(BaseModel):
 class DashboardSnapshot(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     market: Optional[MarketState] = None
+    features: Optional[FeatureState] = None
     execution: Optional[ExecutionState] = None
     risk: Optional[RiskState] = None
     performance: Optional[PerformanceState] = None

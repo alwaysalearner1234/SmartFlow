@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { getDashboardSnapshot } from './api';
 import type { DashboardSnapshot } from './types';
 import { OrderBook } from './components/OrderBook';
+import { MarketFeatures } from './components/MarketFeatures';
 import { Execution } from './components/Execution';
 import { Risk } from './components/Risk';
 import { Performance } from './components/Performance';
@@ -9,6 +10,7 @@ import { Performance } from './components/Performance';
 export default function App() {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [status, setStatus] = useState('Connecting to dashboard API…');
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -18,5 +20,18 @@ export default function App() {
     return () => controller.abort();
   }, []);
 
-  return <main><header><div><span className="eyebrow">SMARTFLOW</span><h1>Execution dashboard</h1><p>Market context, execution decisions, risk, and backtest results.</p></div><span className="status">{status}</span></header><div className="grid"><OrderBook market={snapshot?.market ?? null} /><Execution execution={snapshot?.execution ?? null} /><Risk risk={snapshot?.risk ?? null} /><Performance performance={snapshot?.performance ?? null} /></div></main>;
+  async function refreshSnapshot() {
+    setRefreshing(true);
+    setStatus('Refreshing dashboard…');
+    try {
+      setSnapshot(await getDashboardSnapshot(undefined, true));
+      setStatus('Connected');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Dashboard API unavailable');
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  return <main><header><div><span className="eyebrow">SMARTFLOW</span><h1>Execution dashboard</h1><p>Market context, execution decisions, risk, and backtest results.</p></div><div className="header-actions"><span className="status">{status}</span><button type="button" onClick={refreshSnapshot} disabled={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div></header><div className="grid"><OrderBook market={snapshot?.market ?? null} /><Execution execution={snapshot?.execution ?? null} /><MarketFeatures features={snapshot?.features ?? null} /><Risk risk={snapshot?.risk ?? null} /><Performance performance={snapshot?.performance ?? null} /></div></main>;
 }
