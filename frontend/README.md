@@ -1,12 +1,13 @@
-# SmartFlow dashboard — Phase 1 contract
+# SmartFlow React frontend
 
-The frontend uses React, TypeScript, Vite and Plotly. Main also contains a working Python Streamlit dashboard at `dashboard/app.py`. The team needs to decide which UI is the primary demo; the React components live in `frontend/src/components/` and chart definitions in `frontend/src/charts/plots.tsx`.
+The frontend uses React, TypeScript, Vite and Plotly. The Python Streamlit dashboard at `dashboard/app.py` remains a functional reference. React components live in `frontend/src/components/` and chart definitions in `frontend/src/charts/plots.tsx`.
 
 ## Information architecture
 
 | View | Question it answers | Source |
 | --- | --- | --- |
 | Order book | What is the current market state and liquidity? | Person 1 market data/features |
+| Market microstructure | How do spread, imbalance, volatility, momentum, and depth change? | Person 1 feature pipeline |
 | Execution | What action was selected, and how much of the order remains? | Person 3 execution/simulation |
 | Risk | How likely are a passive fill and post-fill adverse movement? | Person 2 model plus Person 3 fill model |
 | Strategy performance | How did the proposed strategy compare with baselines? | Person 3 backtest |
@@ -15,14 +16,15 @@ The initial page shows all four views. Missing sections show an empty state; no 
 
 ## API contract
 
-**Integration status:** Main currently runs Streamlit directly against Python modules. It has no FastAPI service or `/api/v1/dashboard/snapshot` endpoint. The TypeScript interface below is a proposed boundary, not an implemented backend response.
+**Integration status:** `api/main.py` serves the FastAPI endpoint. The React dev server proxies `/api` to port 8000. Start both services to see real data.
 
-`GET /api/v1/dashboard/snapshot` returns `DashboardSnapshot` from [`src/types.ts`](src/types.ts). `schema_version` must be `"1.0"`. The four section values may be `null` until their producers are ready. Vite proxies `/api` to `http://127.0.0.1:8000`; set `VITE_API_BASE_URL` to override the API origin.
+`GET /api/v1/dashboard/snapshot` returns `DashboardSnapshot` from [`src/types.ts`](src/types.ts). `schema_version` is `"1.0"`. Sections may be `null` until their producers are ready. Set `VITE_API_BASE_URL` to override the API origin.
 
 ```json
 {
   "schema_version": "1.0",
   "market": null,
+  "features": null,
   "execution": null,
   "risk": null,
   "performance": null
@@ -33,23 +35,31 @@ All timestamps are UTC ISO 8601 strings. Quantities use the instrument's base un
 
 `adverse_selection_probability` represents post-fill adverse price movement over `prediction_horizon_ms`. The backend must keep the label definition and horizon consistent with the model contract. `fill_probability` is the estimated probability that a passive order at the current quote fills over the same horizon, unless a separate horizon is added to the schema in a later version.
 
+`features.points` contains up to 80 chronological observations from the existing feature pipeline. Each point supplies spread in bps, L1 depth imbalance as a ratio, instantaneous order-flow imbalance in signed quantity, 10-tick log-return volatility, 5-tick simple-return momentum, and bid/ask depth in base units. Individual metrics may be `null` when unavailable. The Phase 1 `market.order_flow_imbalance` field is a legacy name for bounded L1 depth imbalance; use `features.points[].ofi_instant` for actual order-flow imbalance. Older API responses may omit `features`; React then shows an empty state.
+
 `ExecutionState.trajectory` is ordered by timestamp. Each point contains remaining and cumulative filled quantity, reference price, nullable execution price, and selected action. `PerformanceState.results` contains one entry per available strategy. Chart inputs are these typed arrays; missing or empty arrays produce empty states. Backtest metrics must come from actual simulation output.
 
-The API can initially return the all-null snapshot above. Later, Person 1 supplies `market`, Person 2 and Person 3 supply `risk`, and Person 3 supplies `execution` and `performance`. The backend should assemble one snapshot, keeping a consistent run/order identity across sections. The frontend currently fetches once on page load; live refresh can be added after the API transport and update cadence are agreed.
+The backend currently supplies `market`, `features`, `execution`, and `performance`. `risk` remains `null` until its full probability contract is available. The frontend fetches on page load; **Refresh data** calls the API with `?refresh=true` to regenerate one consistent market, execution, and backtest snapshot. Automatic polling can be added when an update cadence is agreed.
 
-Before backend integration, agree on these mappings with the module owners:
+Current API adapter mappings:
 
 - Python `MarketSnapshot.timestamp` is a `float`; convert it to an explicit UTC ISO 8601 string at the API boundary and confirm its epoch/unit. Python book levels are `(price, size)` tuples; serialize them as `{ price, quantity }`.
 - Python `OrderSide` uses `BUY`/`SELL`; the frontend uses lowercase values. Python strategy names must be mapped to the frontend's strategy identifiers.
 - `PredictionResult.prediction_horizon` is measured in **ticks**, while the proposed frontend field `prediction_horizon_ms` is time. Do not convert without a defined tick cadence; change the API field/unit or expose both explicitly.
 - `ExecutionDecision.urgency` may provide the continuous score, but the selected action needs an agreed mapping from the Python strategy decision. `ExecutionResult` provides shortfall in bps, while slippage, impact, and adverse-selection cost are in quote-currency amounts and need an agreed bps conversion.
-- The current `FillModel` simulates fills but exposes no dashboard `fill_probability` contract. The value should remain unavailable until the owner defines an estimator and horizon; do not display an invented zero.
+- The current `FillModel` simulates fills but exposes no dashboard `fill_probability` contract. The risk section remains unavailable until the owner defines an estimator and horizon.
 
 ## Run
 
 ```bash
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal:
+
+```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 

@@ -15,7 +15,22 @@ export interface MarketState {
   asks: BookLevel[]; // best ask first
   mid_price: number;
   spread: number;
-  order_flow_imbalance: number; // [-1, 1]
+  order_flow_imbalance: number; // legacy API name; currently L1 depth imbalance [-1, 1]
+}
+
+export interface FeaturePoint {
+  timestamp: string; // UTC ISO 8601
+  spread_bps: number | null;
+  depth_imbalance_l1: number | null; // [-1, 1]
+  ofi_instant: number | null; // signed quantity
+  volatility_std_10: number | null; // log-return standard deviation
+  momentum_ret_5: number | null; // five-tick simple return
+  total_bid_depth: number;
+  total_ask_depth: number;
+}
+
+export interface FeatureState {
+  points: FeaturePoint[]; // oldest first
 }
 
 export interface ExecutionPoint {
@@ -67,6 +82,7 @@ export interface PerformanceState {
 export interface DashboardSnapshot {
   schema_version: '1.0';
   market: MarketState | null;
+  features?: FeatureState | null; // optional while older API deployments remain in use
   execution: ExecutionState | null;
   risk: RiskState | null;
   performance: PerformanceState | null;
