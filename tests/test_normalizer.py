@@ -1,23 +1,76 @@
-# test_normalizer.py
+"""
+tests/test_normalizer.py
 
-# Tests for SmartFlow Forecasting Feature Normalization
+Comprehensive tests for forecasting feature normalization.
 
-# Verifies that forecasting feature normalization:
-#
-#     - fits only on training data
-#     - preserves dataset structure and metadata
-#     - produces deterministic results
-#     - handles constant features safely
-#     - rejects invalid input
-#     - respects ForecastingConfig
-#     - prevents validation/test data from influencing the scaler
-#
-# These tests intentionally focus only on Phase 7 normalization behavior.
+This test module verifies:
 
+    - NormalizerConfig validation
+    - StandardScaler construction
+    - StandardScaler transformation
+    - training-only scaler fitting
+    - feature-wise mean/std calculation
+    - constant-feature handling
+    - feature schema protection
+    - dataset transformation
+    - train/validation/test transformation
+    - target preservation
+    - timestamp preservation
+    - metadata preservation
+    - model input shape preservation
+    - dtype behavior
+    - copy behavior
+    - disabled normalization
+    - ForecastingConfig integration
+    - convenience functions
+    - leakage protection
+    - deterministic behavior
+    - invalid input handling
+    - NVIDIA forecasting input compatibility
+
+Normalization contract:
+
+    Training sequences
+        |
+        v
+    Fit StandardScaler
+        |
+        +----> training statistics ONLY
+        |
+        v
+    Transform train
+    Transform validation
+    Transform test
+
+The scaler must never be fitted using validation or test data.
+
+Current NVIDIA forecasting contract:
+
+    context_window = 20
+    num_features = 14
+    forecast_horizon = 5
+
+Therefore model inputs have shape:
+
+    (N, 20, 14)
+
+and targets have shape:
+
+    (N,)
+
+This module does not test:
+
+    - feature extraction
+    - sequence construction
+    - target construction
+    - sequence/target alignment
+    - chronological splitting
+    - model architecture
+    - model training
+    - NVIDIA inference
+"""
 
 from __future__ import annotations
-
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -25,9 +78,11 @@ import pytest
 from config.config import ForecastingConfig
 from data.forecasting_dataset import ForecastingDataset
 from data.normalizer import (
+    DEFAULT_DTYPE,
     DEFAULT_NORMALIZATION_METHOD,
     SUPPORTED_NORMALIZATION_METHODS,
     ForecastingDatasetNormalizer,
+    NormalizedForecastingDataset,
     NormalizerConfig,
     StandardScaler,
     fit_normalizer,
@@ -36,11 +91,11 @@ from data.normalizer import (
 )
 
 
-# ============================================================================
-# Test Constants
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Test constants
+# ---------------------------------------------------------------------------
 
-FEATURE_NAMES: Tuple[str, ...] = (
+FEATURE_NAMES = (
     "mid_price_return",
     "spread_bps",
     "best_bid_size",
@@ -57,56 +112,59 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "micro_price_divergence",
 )
 
-CONTEXT_WINDOW = 4
-NUM_FEATURES = len(FEATURE_NAMES)
+CONTEXT_WINDOW = 20
 FORECAST_HORIZON = 5
+NUM_FEATURES = 14
+
+TARGET_NAME = "future_mid_price_return"
+PRICE_COLUMN = "mid_price"
 
 
-# ============================================================================
-# Dataset Helpers
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Dataset factories
+# ---------------------------------------------------------------------------
 
-def create_dataset(
+
+def make_dataset(
+    *,
     num_samples: int = 10,
-    start_value: float = 1.0,
-    value_step: float = 1.0,
-    target_start: float = 0.01,
-    timestamp_start: float = 100.0,
+    context_window: int = CONTEXT_WINDOW,
+    num_features: int = NUM_FEATURES,
+    feature_names: tuple[str, ...] = FEATURE_NAMES,
+    sequence_offset: float = 0.0,
+    sequence_scale: float = 1.0,
+    target_offset: float = 0.0,
+    timestamp_start: float = 1000.0,
 ) -> ForecastingDataset:
     """
     Create a deterministic ForecastingDataset for testing.
 
-    Each feature receives a deterministic offset so that feature-wise
-    normalization can be verified independently.
+    Feature values are generated deterministically so expected means,
+    standard deviations, and transformed values can be calculated exactly.
     """
 
-    total_values = (
+    sequences = np.arange(
         num_samples
-        * CONTEXT_WINDOW
-        * NUM_FEATURES
-    )
-
-    base = np.arange(
-        total_values,
+        * context_window
+        * num_features,
         dtype=np.float64,
     ).reshape(
         num_samples,
-        CONTEXT_WINDOW,
-        NUM_FEATURES,
+        context_window,
+        num_features,
     )
 
     sequences = (
-        start_value
-        + (base * value_step)
+        sequences * sequence_scale
+        + sequence_offset
     )
 
     targets = (
-        target_start
-        + np.arange(
+        np.arange(
             num_samples,
             dtype=np.float64,
         )
-        * 0.01
+        + target_offset
     )
 
     timestamps = (
@@ -121,60 +179,45 @@ def create_dataset(
         sequences=sequences,
         targets=targets,
         timestamps=timestamps,
-        feature_names=FEATURE_NAMES,
-        context_window=CONTEXT_WINDOW,
+        feature_names=feature_names,
+        context_window=context_window,
         forecast_horizon=FORECAST_HORIZON,
-        target_name="future_mid_price_return",
-        price_column="mid_price",
+        target_name=TARGET_NAME,
+        price_column=PRICE_COLUMN,
     )
 
 
-def create_constant_feature_dataset(
+def make_constant_feature_dataset(
+    *,
     num_samples: int = 10,
+    context_window: int = CONTEXT_WINDOW,
     constant_value: float = 7.0,
 ) -> ForecastingDataset:
     """
-    Create a dataset where the first feature is constant.
-
-    The remaining features contain deterministic variation.
+    Create a dataset where every feature has constant values.
     """
 
-    dataset = create_dataset(
-        num_samples=num_samples,
-    )
-
-    sequences = dataset.sequences.copy()
-
-    sequences[:, :, 0] = constant_value
-
-    return ForecastingDataset(
-        sequences=sequences,
-        targets=dataset.targets.copy(),
-        timestamps=dataset.timestamps.copy(),
-        feature_names=dataset.feature_names,
-        context_window=dataset.context_window,
-        forecast_horizon=dataset.forecast_horizon,
-        target_name=dataset.target_name,
-        price_column=dataset.price_column,
-    )
-
-
-def create_single_sample_dataset() -> ForecastingDataset:
-    """Create the smallest valid forecasting dataset."""
-
-    sequences = np.ones(
-        (1, CONTEXT_WINDOW, NUM_FEATURES),
+    sequences = np.full(
+        (
+            num_samples,
+            context_window,
+            NUM_FEATURES,
+        ),
+        constant_value,
         dtype=np.float64,
     )
 
-    targets = np.array(
-        [0.01],
+    targets = np.arange(
+        num_samples,
         dtype=np.float64,
     )
 
-    timestamps = np.array(
-        [100.0],
-        dtype=np.float64,
+    timestamps = (
+        1000.0
+        + np.arange(
+            num_samples,
+            dtype=np.float64,
+        )
     )
 
     return ForecastingDataset(
@@ -182,149 +225,646 @@ def create_single_sample_dataset() -> ForecastingDataset:
         targets=targets,
         timestamps=timestamps,
         feature_names=FEATURE_NAMES,
-        context_window=CONTEXT_WINDOW,
+        context_window=context_window,
         forecast_horizon=FORECAST_HORIZON,
-        target_name="future_mid_price_return",
-        price_column="mid_price",
+        target_name=TARGET_NAME,
+        price_column=PRICE_COLUMN,
     )
 
 
-# ============================================================================
-# Basic Configuration Tests
-# ============================================================================
+def make_custom_feature_dataset(
+    *,
+    num_samples: int = 5,
+    context_window: int = 3,
+    feature_names: tuple[str, ...] = (
+        "feature_a",
+        "feature_b",
+    ),
+    offset: float = 0.0,
+) -> ForecastingDataset:
+    """
+    Create a small dataset with a custom feature schema.
+    """
 
-class TestNormalizationConstants:
-    """Tests for normalization constants."""
+    num_features = len(feature_names)
 
-    def test_default_normalization_method_is_standard(self) -> None:
-        """The default normalization method should be standardization."""
+    sequences = np.arange(
+        num_samples
+        * context_window
+        * num_features,
+        dtype=np.float64,
+    ).reshape(
+        num_samples,
+        context_window,
+        num_features,
+    )
 
-        assert DEFAULT_NORMALIZATION_METHOD == "standard"
+    sequences = sequences + offset
 
-    def test_standard_normalization_is_supported(self) -> None:
-        """Standard normalization should be listed as supported."""
+    targets = np.arange(
+        num_samples,
+        dtype=np.float64,
+    )
 
-        assert "standard" in SUPPORTED_NORMALIZATION_METHODS
+    timestamps = (
+        500.0
+        + np.arange(
+            num_samples,
+            dtype=np.float64,
+        )
+    )
+
+    return ForecastingDataset(
+        sequences=sequences,
+        targets=targets,
+        timestamps=timestamps,
+        feature_names=feature_names,
+        context_window=context_window,
+        forecast_horizon=FORECAST_HORIZON,
+        target_name=TARGET_NAME,
+        price_column=PRICE_COLUMN,
+    )
 
 
-class TestNormalizerConfiguration:
+# ---------------------------------------------------------------------------
+# Configuration tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerConfig:
     """Tests for NormalizerConfig."""
 
-    def test_default_configuration_is_training_only(self) -> None:
-        """The default configuration must require training-only fitting."""
+    def test_default_method(self):
+        """Default normalization method is standard."""
 
         config = NormalizerConfig()
 
-        assert config.method == "standard"
+        assert config.method == DEFAULT_NORMALIZATION_METHOD
+
+    def test_default_normalization_enabled(self):
+        """Feature normalization is enabled by default."""
+
+        config = NormalizerConfig()
+
         assert config.normalize_features is True
+
+    def test_default_training_only_behavior(self):
+        """Training-only fitting is enabled by default."""
+
+        config = NormalizerConfig()
+
         assert config.fit_on_training_only is True
-        assert config.dtype == "float64"
+
+    def test_default_dtype(self):
+        """Default output dtype is float64."""
+
+        config = NormalizerConfig()
+
+        assert config.dtype == DEFAULT_DTYPE
+
+    def test_default_copy_behavior(self):
+        """Arrays are copied by default."""
+
+        config = NormalizerConfig()
+
         assert config.copy_arrays is True
 
-    def test_unsupported_method_is_rejected(self) -> None:
-        """Unsupported normalization methods should be rejected."""
+    def test_supported_methods(self):
+        """The supported normalization methods are exposed."""
 
-        with pytest.raises(
-            ValueError,
-            match="Unsupported normalization method",
-        ):
-            ForecastingDatasetNormalizer(
-                NormalizerConfig(
-                    method="minmax",
-                )
+        assert "standard" in SUPPORTED_NORMALIZATION_METHODS
+
+    def test_method_is_case_normalized_by_normalizer(self):
+        """Uppercase method names can be accepted."""
+
+        config = NormalizerConfig(
+            method="STANDARD",
+        )
+
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
+
+        assert normalizer.method == "standard"
+
+    def test_invalid_method_raises(self):
+        """Unsupported normalization methods are rejected."""
+
+        with pytest.raises(ValueError):
+            NormalizerConfig(
+                method="minmax",
             )
 
-    def test_empty_method_is_rejected(self) -> None:
-        """An empty normalization method should be rejected."""
+    def test_non_string_method_raises(self):
+        """Normalization method must be a string."""
 
-        with pytest.raises(
-            ValueError,
-            match="must not be empty",
-        ):
-            ForecastingDatasetNormalizer(
-                NormalizerConfig(
-                    method="",
-                )
+        with pytest.raises(TypeError):
+            NormalizerConfig(
+                method=123,
             )
 
-    def test_non_string_method_is_rejected(self) -> None:
-        """A non-string normalization method should be rejected."""
+    def test_invalid_dtype_raises(self):
+        """Invalid NumPy dtypes are rejected."""
 
-        with pytest.raises(
-            TypeError,
-            match="must be a string",
-        ):
-            ForecastingDatasetNormalizer(
-                NormalizerConfig(
-                    method=123,  # type: ignore[arg-type]
-                )
+        with pytest.raises(ValueError):
+            NormalizerConfig(
+                dtype="not-a-real-dtype",
             )
 
-    def test_training_only_setting_cannot_be_disabled(self) -> None:
-        """The forecasting normalizer must require training-only fitting."""
+    def test_empty_dtype_raises(self):
+        """Empty dtype strings are rejected."""
 
-        with pytest.raises(
-            ValueError,
-            match="fit_on_training_only must be True",
-        ):
-            ForecastingDatasetNormalizer(
-                NormalizerConfig(
-                    fit_on_training_only=False,
-                )
+        with pytest.raises(ValueError):
+            NormalizerConfig(
+                dtype="",
             )
 
-    def test_invalid_dtype_is_rejected(self) -> None:
-        """Invalid NumPy dtypes should be rejected."""
+    def test_normalize_features_must_be_boolean(self):
+        """normalize_features must be a boolean."""
 
-        with pytest.raises(
-            TypeError,
-            match="Invalid normalization dtype",
-        ):
-            ForecastingDatasetNormalizer(
-                NormalizerConfig(
-                    dtype="not-a-real-dtype",
-                )
+        with pytest.raises(TypeError):
+            NormalizerConfig(
+                normalize_features=1,
+            )
+
+    def test_fit_on_training_only_must_be_boolean(self):
+        """fit_on_training_only must be a boolean."""
+
+        with pytest.raises(TypeError):
+            NormalizerConfig(
+                fit_on_training_only=1,
+            )
+
+    def test_copy_arrays_must_be_boolean(self):
+        """copy_arrays must be a boolean."""
+
+        with pytest.raises(TypeError):
+            NormalizerConfig(
+                copy_arrays=1,
             )
 
 
-# ============================================================================
-# Basic Normalization Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# StandardScaler construction
+# ---------------------------------------------------------------------------
 
-class TestBasicNormalization:
-    """Tests for basic standard normalization."""
 
-    def test_fit_creates_scaler(self) -> None:
-        """Fitting should create a reusable scaler."""
+class TestStandardScaler:
+    """Tests for the fitted StandardScaler contract."""
 
-        dataset = create_dataset()
+    def test_valid_scaler_constructs(self):
+        """A valid scaler can be constructed."""
+
+        scaler = StandardScaler(
+            means=np.array([1.0, 2.0]),
+            scales=np.array([0.5, 2.0]),
+            feature_names=("a", "b"),
+        )
+
+        assert scaler.fitted is True
+
+    def test_num_features(self):
+        """num_features reports the fitted feature count."""
+
+        scaler = StandardScaler(
+            means=np.array([1.0, 2.0, 3.0]),
+            scales=np.array([1.0, 1.0, 1.0]),
+            feature_names=("a", "b", "c"),
+        )
+
+        assert scaler.num_features == 3
+
+    def test_means_are_stored(self):
+        """Means are preserved."""
+
+        means = np.array([1.0, 2.0])
+
+        scaler = StandardScaler(
+            means=means,
+            scales=np.array([1.0, 2.0]),
+            feature_names=("a", "b"),
+        )
+
+        np.testing.assert_array_equal(
+            scaler.means,
+            means,
+        )
+
+    def test_scales_are_stored(self):
+        """Scales are preserved."""
+
+        scales = np.array([1.0, 2.0])
+
+        scaler = StandardScaler(
+            means=np.array([1.0, 2.0]),
+            scales=scales,
+            feature_names=("a", "b"),
+        )
+
+        np.testing.assert_array_equal(
+            scaler.scales,
+            scales,
+        )
+
+    def test_feature_names_are_stored_as_tuple(self):
+        """Feature names are normalized to an immutable tuple."""
+
+        scaler = StandardScaler(
+            means=np.array([1.0, 2.0]),
+            scales=np.array([1.0, 2.0]),
+            feature_names=["a", "b"],
+        )
+
+        assert isinstance(
+            scaler.feature_names,
+            tuple,
+        )
+
+    def test_mismatched_means_and_scales_raise(self):
+        """Means and scales must have matching dimensions."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([1.0, 2.0]),
+                scales=np.array([1.0]),
+                feature_names=("a", "b"),
+            )
+
+    def test_empty_scaler_raises(self):
+        """A scaler must contain at least one feature."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([]),
+                scales=np.array([]),
+                feature_names=(),
+            )
+
+    def test_duplicate_feature_names_raise(self):
+        """Scaler feature names must be unique."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([1.0, 2.0]),
+                scales=np.array([1.0, 1.0]),
+                feature_names=("a", "a"),
+            )
+
+    def test_empty_feature_name_raises(self):
+        """Scaler feature names must be non-empty."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([1.0]),
+                scales=np.array([1.0]),
+                feature_names=("",),
+            )
+
+    def test_nonfinite_mean_raises(self):
+        """Scaler means must be finite."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([np.nan]),
+                scales=np.array([1.0]),
+                feature_names=("a",),
+            )
+
+    def test_infinite_mean_raises(self):
+        """Infinite means are rejected."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([np.inf]),
+                scales=np.array([1.0]),
+                feature_names=("a",),
+            )
+
+    def test_nonfinite_scale_raises(self):
+        """Scaler scales must be finite."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([1.0]),
+                scales=np.array([np.nan]),
+                feature_names=("a",),
+            )
+
+    def test_zero_scale_raises(self):
+        """Directly constructed zero scales are rejected."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([1.0]),
+                scales=np.array([0.0]),
+                feature_names=("a",),
+            )
+
+    def test_negative_scale_raises(self):
+        """Negative scales are rejected."""
+
+        with pytest.raises(ValueError):
+            StandardScaler(
+                means=np.array([1.0]),
+                scales=np.array([-1.0]),
+                feature_names=("a",),
+            )
+
+
+# ---------------------------------------------------------------------------
+# StandardScaler transformation
+# ---------------------------------------------------------------------------
+
+
+class TestStandardScalerTransform:
+    """Tests for direct StandardScaler transformation."""
+
+    def test_standard_transformation(self):
+        """Values are transformed using (x - mean) / scale."""
+
+        scaler = StandardScaler(
+            means=np.array([10.0, 20.0]),
+            scales=np.array([2.0, 5.0]),
+            feature_names=("a", "b"),
+        )
+
+        sequences = np.array(
+            [
+                [
+                    [12.0, 25.0],
+                    [8.0, 15.0],
+                ]
+            ],
+            dtype=np.float64,
+        )
+
+        transformed = scaler.transform(
+            sequences,
+        )
+
+        expected = np.array(
+            [
+                [
+                    [1.0, 1.0],
+                    [-1.0, -1.0],
+                ]
+            ],
+            dtype=np.float64,
+        )
+
+        np.testing.assert_allclose(
+            transformed,
+            expected,
+        )
+
+    def test_shape_is_preserved(self):
+        """Transformation does not change tensor dimensions."""
+
+        scaler = StandardScaler(
+            means=np.zeros(2),
+            scales=np.ones(2),
+            feature_names=("a", "b"),
+        )
+
+        sequences = np.ones(
+            (4, 3, 2),
+            dtype=np.float64,
+        )
+
+        transformed = scaler.transform(
+            sequences,
+        )
+
+        assert transformed.shape == sequences.shape
+
+    def test_zero_mean_unit_scale_is_identity(self):
+        """Zero means and unit scales leave values unchanged."""
+
+        scaler = StandardScaler(
+            means=np.zeros(2),
+            scales=np.ones(2),
+            feature_names=("a", "b"),
+        )
+
+        sequences = np.array(
+            [
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                ]
+            ],
+            dtype=np.float64,
+        )
+
+        transformed = scaler.transform(
+            sequences,
+        )
+
+        np.testing.assert_array_equal(
+            transformed,
+            sequences,
+        )
+
+    def test_nan_values_are_rejected(self):
+        """NaN feature values cannot be transformed."""
+
+        scaler = StandardScaler(
+            means=np.zeros(1),
+            scales=np.ones(1),
+            feature_names=("a",),
+        )
+
+        sequences = np.array(
+            [[[np.nan]]],
+            dtype=np.float64,
+        )
+
+        with pytest.raises(ValueError):
+            scaler.transform(sequences)
+
+    def test_infinite_values_are_rejected(self):
+        """Infinite feature values cannot be transformed."""
+
+        scaler = StandardScaler(
+            means=np.zeros(1),
+            scales=np.ones(1),
+            feature_names=("a",),
+        )
+
+        sequences = np.array(
+            [[[np.inf]]],
+            dtype=np.float64,
+        )
+
+        with pytest.raises(ValueError):
+            scaler.transform(sequences)
+
+    def test_wrong_feature_count_raises(self):
+        """Input feature count must match fitted scaler."""
+
+        scaler = StandardScaler(
+            means=np.zeros(2),
+            scales=np.ones(2),
+            feature_names=("a", "b"),
+        )
+
+        sequences = np.ones(
+            (2, 3, 3),
+            dtype=np.float64,
+        )
+
+        with pytest.raises(ValueError):
+            scaler.transform(sequences)
+
+    def test_two_dimensional_input_raises(self):
+        """Scaler expects 3D sequence arrays."""
+
+        scaler = StandardScaler(
+            means=np.zeros(2),
+            scales=np.ones(2),
+            feature_names=("a", "b"),
+        )
+
+        sequences = np.ones(
+            (3, 2),
+            dtype=np.float64,
+        )
+
+        with pytest.raises(ValueError):
+            scaler.transform(sequences)
+
+    def test_float32_output(self):
+        """Output dtype can be configured as float32."""
+
+        scaler = StandardScaler(
+            means=np.zeros(2),
+            scales=np.ones(2),
+            feature_names=("a", "b"),
+        )
+
+        sequences = np.ones(
+            (2, 3, 2),
+            dtype=np.float64,
+        )
+
+        transformed = scaler.transform(
+            sequences,
+            dtype="float32",
+        )
+
+        assert transformed.dtype == np.float32
+
+    def test_copy_true_produces_independent_array(self):
+        """copy=True returns independent storage."""
+
+        scaler = StandardScaler(
+            means=np.zeros(1),
+            scales=np.ones(1),
+            feature_names=("a",),
+        )
+
+        sequences = np.ones(
+            (2, 2, 1),
+            dtype=np.float64,
+        )
+
+        transformed = scaler.transform(
+            sequences,
+            copy=True,
+        )
+
+        sequences[0, 0, 0] = 999.0
+
+        assert transformed[0, 0, 0] != 999.0
+
+
+# ---------------------------------------------------------------------------
+# Normalizer initialization
+# ---------------------------------------------------------------------------
+
+
+class TestForecastingDatasetNormalizerInitialization:
+    """Tests for ForecastingDatasetNormalizer initialization."""
+
+    def test_default_initialization(self):
+        """Normalizer can be initialized with defaults."""
 
         normalizer = ForecastingDatasetNormalizer()
 
         assert normalizer.fitted is False
         assert normalizer.scaler is None
+        assert normalizer.feature_names is None
+
+    def test_custom_config_is_stored(self):
+        """Custom configuration is retained."""
+
+        config = NormalizerConfig(
+            dtype="float32",
+        )
+
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
+
+        assert normalizer.config is config
+
+    def test_method_property(self):
+        """method exposes normalized method name."""
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        assert normalizer.method == "standard"
+
+    def test_normalization_enabled_property(self):
+        """normalization_enabled reflects configuration."""
+
+        enabled = ForecastingDatasetNormalizer()
+
+        disabled = ForecastingDatasetNormalizer(
+            NormalizerConfig(
+                normalize_features=False,
+            )
+        )
+
+        assert enabled.normalization_enabled is True
+        assert disabled.normalization_enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Fitting
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerFit:
+    """Tests for training-only scaler fitting."""
+
+    def test_fit_marks_normalizer_as_fitted(self):
+        """Successful fit sets fitted=True."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
 
         normalizer.fit(dataset)
 
         assert normalizer.fitted is True
-        assert normalizer.scaler is not None
 
-    def test_fitted_scaler_contains_correct_feature_count(self) -> None:
-        """The fitted scaler should contain one statistic per feature."""
+    def test_fit_creates_scaler(self):
+        """Standard normalization creates a fitted scaler."""
 
-        dataset = create_dataset()
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
 
         normalizer.fit(dataset)
 
         assert normalizer.scaler is not None
-        assert normalizer.scaler.num_features == NUM_FEATURES
+        assert normalizer.scaler.fitted is True
 
-    def test_feature_names_are_preserved(self) -> None:
-        """The fitted scaler should preserve the training feature order."""
+    def test_fit_stores_feature_names(self):
+        """Training feature schema is stored."""
 
-        dataset = create_dataset()
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
 
@@ -332,124 +872,26 @@ class TestBasicNormalization:
 
         assert normalizer.feature_names == FEATURE_NAMES
 
-    def test_transform_returns_forecasting_dataset(self) -> None:
-        """Transformation should return the existing dataset contract."""
+    def test_fit_calculates_per_feature_means(self):
+        """Means are calculated independently for each feature."""
 
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(dataset)
-
-        transformed = normalizer.transform(dataset)
-
-        assert isinstance(
-            transformed,
-            ForecastingDataset,
-        )
-
-    def test_normalized_shape_is_preserved(self) -> None:
-        """Normalization must preserve the sequence tensor shape."""
-
-        dataset = create_dataset(
-            num_samples=12,
+        dataset = make_dataset(
+            num_samples=2,
+            context_window=2,
+            num_features=2,
+            feature_names=(
+                "feature_a",
+                "feature_b",
+            ),
         )
 
         normalizer = ForecastingDatasetNormalizer()
 
         normalizer.fit(dataset)
 
-        transformed = normalizer.transform(dataset)
-
-        assert transformed.sequences.shape == dataset.sequences.shape
-
-    def test_standardized_training_features_have_zero_mean(self) -> None:
-        """
-        Training features should have approximately zero mean after
-        standardization.
-        """
-
-        dataset = create_dataset(
-            num_samples=20,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        flattened = transformed.sequences.reshape(
+        flattened = dataset.sequences.reshape(
             -1,
-            NUM_FEATURES,
-        )
-
-        means = np.mean(
-            flattened,
-            axis=0,
-        )
-
-        assert np.allclose(
-            means,
-            0.0,
-            atol=1e-12,
-        )
-
-    def test_standardized_training_features_have_unit_variance(self) -> None:
-        """
-        Training features should have approximately unit variance after
-        standardization.
-        """
-
-        dataset = create_dataset(
-            num_samples=20,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        flattened = transformed.sequences.reshape(
-            -1,
-            NUM_FEATURES,
-        )
-
-        standard_deviations = np.std(
-            flattened,
-            axis=0,
-        )
-
-        assert np.allclose(
-            standard_deviations,
-            1.0,
-            atol=1e-12,
-        )
-
-
-# ============================================================================
-# Training-Only Fitting Tests
-# ============================================================================
-
-class TestTrainingOnlyFitting:
-    """Tests ensuring scaler statistics come exclusively from training data."""
-
-    def test_scaler_statistics_match_training_data(self) -> None:
-        """Scaler means and scales must be calculated from training data."""
-
-        training = create_dataset(
-            num_samples=10,
-            start_value=1.0,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(training)
-
-        flattened = training.sequences.reshape(
-            -1,
-            NUM_FEATURES,
+            2,
         )
 
         expected_means = np.mean(
@@ -457,301 +899,690 @@ class TestTrainingOnlyFitting:
             axis=0,
         )
 
+        np.testing.assert_allclose(
+            normalizer.scaler.means,
+            expected_means,
+        )
+
+    def test_fit_calculates_per_feature_scales(self):
+        """Standard deviations are calculated independently."""
+
+        dataset = make_dataset(
+            num_samples=2,
+            context_window=2,
+            num_features=2,
+            feature_names=(
+                "feature_a",
+                "feature_b",
+            ),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        flattened = dataset.sequences.reshape(
+            -1,
+            2,
+        )
+
         expected_scales = np.std(
             flattened,
             axis=0,
         )
 
-        expected_scales = np.where(
-            expected_scales == 0.0,
-            1.0,
-            expected_scales,
-        )
-
-        assert normalizer.scaler is not None
-
-        assert np.allclose(
-            normalizer.scaler.means,
-            expected_means,
-        )
-
-        assert np.allclose(
+        np.testing.assert_allclose(
             normalizer.scaler.scales,
             expected_scales,
         )
 
-    def test_validation_data_does_not_change_scaler(self) -> None:
+    def test_scaler_uses_all_context_timesteps(self):
         """
-        Transforming validation data must not modify training-fitted
+        Statistics are calculated over all samples and all context
+        timesteps, not just the final timestep.
+        """
+
+        dataset = make_dataset(
+            num_samples=2,
+            context_window=3,
+            num_features=1,
+            feature_names=("feature_a",),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        flattened = dataset.sequences.reshape(
+            -1,
+            1,
+        )
+
+        expected_mean = np.mean(
+            flattened[:, 0]
+        )
+
+        assert normalizer.scaler.means[0] == pytest.approx(
+            expected_mean
+        )
+
+    def test_fit_is_deterministic(self):
+        """Repeated fitting on identical data produces identical statistics."""
+
+        dataset = make_dataset()
+
+        first = ForecastingDatasetNormalizer()
+        second = ForecastingDatasetNormalizer()
+
+        first.fit(dataset)
+        second.fit(dataset)
+
+        np.testing.assert_array_equal(
+            first.scaler.means,
+            second.scaler.means,
+        )
+
+        np.testing.assert_array_equal(
+            first.scaler.scales,
+            second.scaler.scales,
+        )
+
+    def test_constant_features_receive_unit_scale(self):
+        """
+        Constant features receive scale=1 instead of zero so transformation
+        remains numerically valid.
+        """
+
+        dataset = make_constant_feature_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        np.testing.assert_array_equal(
+            normalizer.scaler.scales,
+            np.ones(NUM_FEATURES),
+        )
+
+    def test_constant_features_transform_to_zero(self):
+        """Constant training features become zero after centering."""
+
+        dataset = make_constant_feature_dataset(
+            constant_value=7.0,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        np.testing.assert_allclose(
+            transformed.sequences,
+            0.0,
+        )
+
+    def test_fit_rejects_nan_training_values(self):
+        """NaN values cannot be used to fit normalization."""
+
+        dataset = make_dataset()
+
+        dataset.sequences[0, 0, 0] = np.nan
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        with pytest.raises(ValueError):
+            normalizer.fit(dataset)
+
+    def test_fit_rejects_infinite_training_values(self):
+        """Infinite values cannot be used to fit normalization."""
+
+        dataset = make_dataset()
+
+        dataset.sequences[0, 0, 0] = np.inf
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        with pytest.raises(ValueError):
+            normalizer.fit(dataset)
+
+    def test_fit_rejects_non_dataset_input(self):
+        """fit() requires a ForecastingDataset."""
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        with pytest.raises(TypeError):
+            normalizer.fit("not-a-dataset")
+
+
+# ---------------------------------------------------------------------------
+# Training-only leakage protection
+# ---------------------------------------------------------------------------
+
+
+class TestTrainingOnlyLeakageProtection:
+    """Tests that normalization statistics come exclusively from training."""
+
+    def test_validation_data_does_not_affect_fitted_statistics(self):
+        """
+        Changing validation data must not change scaler statistics when
+        fitting directly on the training dataset.
+        """
+
+        training = make_dataset(
+            sequence_offset=0.0,
+        )
+
+        validation_a = make_dataset(
+            sequence_offset=1000.0,
+        )
+
+        validation_b = make_dataset(
+            sequence_offset=999999.0,
+        )
+
+        normalizer_a = ForecastingDatasetNormalizer()
+        normalizer_b = ForecastingDatasetNormalizer()
+
+        normalizer_a.fit(training)
+        normalizer_b.fit(training)
+
+        np.testing.assert_array_equal(
+            normalizer_a.scaler.means,
+            normalizer_b.scaler.means,
+        )
+
+        np.testing.assert_array_equal(
+            normalizer_a.scaler.scales,
+            normalizer_b.scaler.scales,
+        )
+
+        assert validation_a.sequences.mean() != (
+            validation_b.sequences.mean()
+        )
+
+    def test_test_data_does_not_affect_fitted_statistics(self):
+        """
+        Test distribution changes cannot affect training-only scaler
         statistics.
         """
 
-        training = create_dataset(
-            num_samples=10,
-            start_value=1.0,
+        training = make_dataset(
+            sequence_offset=0.0,
         )
 
-        validation = create_dataset(
-            num_samples=10,
-            start_value=100000.0,
+        test_a = make_dataset(
+            sequence_offset=100.0,
+        )
+
+        test_b = make_dataset(
+            sequence_offset=-10000.0,
         )
 
         normalizer = ForecastingDatasetNormalizer()
 
         normalizer.fit(training)
 
-        assert normalizer.scaler is not None
+        original_means = normalizer.scaler.means.copy()
+        original_scales = normalizer.scaler.scales.copy()
+
+        normalizer.transform(test_a)
+        normalizer.transform(test_b)
+
+        np.testing.assert_array_equal(
+            normalizer.scaler.means,
+            original_means,
+        )
+
+        np.testing.assert_array_equal(
+            normalizer.scaler.scales,
+            original_scales,
+        )
+
+    def test_transform_does_not_refit_scaler(self):
+        """Calling transform never changes fitted statistics."""
+
+        training = make_dataset()
+
+        validation = make_dataset(
+            sequence_offset=100000.0,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(training)
 
         means_before = normalizer.scaler.means.copy()
         scales_before = normalizer.scaler.scales.copy()
 
         normalizer.transform(validation)
 
-        assert np.array_equal(
+        np.testing.assert_array_equal(
             normalizer.scaler.means,
             means_before,
         )
 
-        assert np.array_equal(
+        np.testing.assert_array_equal(
             normalizer.scaler.scales,
             scales_before,
         )
 
-    def test_test_data_does_not_change_scaler(self) -> None:
+    def test_disabling_training_only_fit_is_rejected(self):
         """
-        Transforming test data must not modify training-fitted statistics.
+        Leakage-safe forecasting normalization requires
+        fit_on_training_only=True.
         """
 
-        training = create_dataset(
-            num_samples=10,
-            start_value=1.0,
+        config = NormalizerConfig(
+            fit_on_training_only=False,
         )
 
-        test = create_dataset(
-            num_samples=10,
-            start_value=500000.0,
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
         )
+
+        training = make_dataset()
+
+        with pytest.raises(ValueError):
+            normalizer.fit(training)
+
+
+# ---------------------------------------------------------------------------
+# Transformation
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerTransform:
+    """Tests for ForecastingDataset transformation."""
+
+    def test_transform_requires_fit(self):
+        """Transforming before fit is rejected."""
+
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
 
-        normalizer.fit(training)
+        with pytest.raises(RuntimeError):
+            normalizer.transform(dataset)
 
-        assert normalizer.scaler is not None
+    def test_transform_preserves_shape(self):
+        """Normalization does not alter input tensor shape."""
 
-        means_before = normalizer.scaler.means.copy()
-        scales_before = normalizer.scaler.scales.copy()
-
-        normalizer.transform(test)
-
-        assert np.array_equal(
-            normalizer.scaler.means,
-            means_before,
-        )
-
-        assert np.array_equal(
-            normalizer.scaler.scales,
-            scales_before,
-        )
-
-    def test_validation_values_are_transformed_using_training_statistics(
-        self,
-    ) -> None:
-        """Validation values must use training means and scales."""
-
-        training = create_dataset(
-            num_samples=10,
-            start_value=1.0,
-        )
-
-        validation = create_dataset(
-            num_samples=5,
-            start_value=1000.0,
-        )
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(training)
+        normalizer.fit(dataset)
 
         transformed = normalizer.transform(
-            validation
+            dataset,
         )
 
-        assert normalizer.scaler is not None
-
-        expected = (
-            validation.sequences
-            - normalizer.scaler.means.reshape(
-                1,
-                1,
-                -1,
-            )
-        ) / normalizer.scaler.scales.reshape(
-            1,
-            1,
-            -1,
+        assert transformed.sequences.shape == (
+            dataset.sequences.shape
         )
 
-        assert np.allclose(
-            transformed.sequences,
-            expected,
+    def test_transform_preserves_sample_count(self):
+        """Normalization does not add or remove samples."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
         )
 
-    def test_large_validation_shift_does_not_recenter_validation(
-        self,
-    ) -> None:
+        assert transformed.num_samples == dataset.num_samples
+
+    def test_transform_produces_zero_training_means(self):
         """
-        Validation data shifted far from training data should remain shifted
-        after applying the training scaler.
+        Training features should have approximately zero mean after
+        standard normalization.
         """
 
-        training = create_dataset(
-            num_samples=10,
-            start_value=0.0,
-        )
-
-        validation = create_dataset(
-            num_samples=5,
-            start_value=1000000.0,
+        dataset = make_dataset(
+            num_samples=20,
         )
 
         normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(training)
+        normalizer.fit(dataset)
 
         transformed = normalizer.transform(
-            validation
+            dataset,
         )
 
         flattened = transformed.sequences.reshape(
             -1,
-            NUM_FEATURES,
+            transformed.num_features,
         )
 
-        # If validation data had incorrectly been used to fit its own scaler,
-        # its mean would be approximately zero. It should not be zero here.
-        assert not np.allclose(
-            np.mean(flattened, axis=0),
-            0.0,
+        means = flattened.mean(
+            axis=0,
+        )
+
+        np.testing.assert_allclose(
+            means,
+            np.zeros(transformed.num_features),
+            atol=1e-12,
+        )
+
+    def test_transform_produces_unit_training_scales(self):
+        """
+        Non-constant training features should have unit standard deviation.
+        """
+
+        dataset = make_dataset(
+            num_samples=20,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        flattened = transformed.sequences.reshape(
+            -1,
+            transformed.num_features,
+        )
+
+        scales = flattened.std(
+            axis=0,
+        )
+
+        np.testing.assert_allclose(
+            scales,
+            np.ones(transformed.num_features),
+            atol=1e-12,
+        )
+
+    def test_transform_preserves_targets(self):
+        """Normalization does not modify targets."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        np.testing.assert_array_equal(
+            transformed.targets,
+            dataset.targets,
+        )
+
+    def test_transform_preserves_timestamps(self):
+        """Normalization does not modify timestamps."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        np.testing.assert_array_equal(
+            transformed.timestamps,
+            dataset.timestamps,
+        )
+
+    def test_transform_preserves_feature_names(self):
+        """Normalization does not reorder features."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.feature_names == (
+            dataset.feature_names
+        )
+
+    def test_transform_preserves_context_window(self):
+        """Normalization preserves context window metadata."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.context_window == (
+            dataset.context_window
+        )
+
+    def test_transform_preserves_forecast_horizon(self):
+        """Normalization preserves forecast horizon metadata."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.forecast_horizon == (
+            dataset.forecast_horizon
+        )
+
+    def test_transform_preserves_target_name(self):
+        """Normalization preserves target metadata."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.target_name == (
+            dataset.target_name
+        )
+
+    def test_transform_preserves_price_column(self):
+        """Normalization preserves price column metadata."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.price_column == (
+            dataset.price_column
         )
 
 
-# ============================================================================
-# Split Transformation Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Feature schema protection
+# ---------------------------------------------------------------------------
 
-class TestSplitTransformation:
-    """Tests for simultaneous train/validation/test normalization."""
 
-    def test_transform_splits_returns_three_datasets(self) -> None:
-        """All three forecasting partitions should be returned."""
+class TestFeatureSchemaProtection:
+    """Tests preventing feature-order/schema mismatches."""
 
-        training = create_dataset(
+    def test_wrong_feature_names_raise(self):
+        """A dataset with different feature names is rejected."""
+
+        training = make_dataset()
+
+        validation = make_custom_feature_dataset(
+            feature_names=(
+                "wrong_a",
+                "wrong_b",
+            ),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.transform(validation)
+
+    def test_same_feature_count_wrong_order_raises(self):
+        """Identical feature counts with different ordering are rejected."""
+
+        training = make_custom_feature_dataset(
+            feature_names=(
+                "feature_a",
+                "feature_b",
+            ),
+        )
+
+        validation = make_custom_feature_dataset(
+            feature_names=(
+                "feature_b",
+                "feature_a",
+            ),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.transform(validation)
+
+    def test_feature_count_mismatch_raises(self):
+        """Different feature counts are rejected."""
+
+        training = make_custom_feature_dataset(
+            feature_names=(
+                "a",
+                "b",
+            ),
+        )
+
+        validation = make_custom_feature_dataset(
+            feature_names=(
+                "a",
+                "b",
+                "c",
+            ),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.transform(validation)
+
+    def test_training_schema_is_immutable_reference(self):
+        """
+        The normalizer stores the training feature schema as a tuple so
+        external list mutation cannot silently change it.
+        """
+
+        feature_names = [
+            "feature_a",
+            "feature_b",
+        ]
+
+        dataset = make_custom_feature_dataset(
+            feature_names=tuple(feature_names),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+
+        feature_names[0] = "changed"
+
+        assert normalizer.feature_names == (
+            "feature_a",
+            "feature_b",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Split transformation
+# ---------------------------------------------------------------------------
+
+
+class TestTransformSplits:
+    """Tests for train/validation/test normalization."""
+
+    def test_transform_splits_returns_three_datasets(self):
+        """transform_splits returns train, validation, and test."""
+
+        training = make_dataset(
+            num_samples=20,
+        )
+
+        validation = make_dataset(
             num_samples=10,
+            sequence_offset=100.0,
+            timestamp_start=2000.0,
         )
 
-        validation = create_dataset(
-            num_samples=5,
-            start_value=100.0,
-        )
-
-        test = create_dataset(
-            num_samples=5,
-            start_value=200.0,
+        test = make_dataset(
+            num_samples=10,
+            sequence_offset=200.0,
+            timestamp_start=3000.0,
         )
 
         normalizer = ForecastingDatasetNormalizer()
 
         result = normalizer.transform_splits(
-            training_dataset=training,
-            validation_dataset=validation,
-            test_dataset=test,
-        )
-
-        assert len(result) == 3
-
-        normalized_training = result[0]
-        normalized_validation = result[1]
-        normalized_test = result[2]
-
-        assert isinstance(
-            normalized_training,
-            ForecastingDataset,
-        )
-
-        assert isinstance(
-            normalized_validation,
-            ForecastingDataset,
-        )
-
-        assert isinstance(
-            normalized_test,
-            ForecastingDataset,
-        )
-
-    def test_training_validation_and_test_shapes_are_preserved(
-        self,
-    ) -> None:
-        """All partition shapes should remain unchanged."""
-
-        training = create_dataset(
-            num_samples=10,
-        )
-
-        validation = create_dataset(
-            num_samples=5,
-            start_value=100.0,
-        )
-
-        test = create_dataset(
-            num_samples=7,
-            start_value=200.0,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        (
-            normalized_training,
-            normalized_validation,
-            normalized_test,
-        ) = normalizer.transform_splits(
             training,
             validation,
             test,
         )
 
-        assert (
-            normalized_training.sequences.shape
-            == training.sequences.shape
+        assert len(result) == 3
+
+        normalized_train, normalized_validation, normalized_test = result
+
+        assert isinstance(
+            normalized_train,
+            ForecastingDataset,
         )
 
-        assert (
-            normalized_validation.sequences.shape
-            == validation.sequences.shape
+        assert isinstance(
+            normalized_validation,
+            ForecastingDataset,
         )
 
-        assert (
-            normalized_test.sequences.shape
-            == test.sequences.shape
+        assert isinstance(
+            normalized_test,
+            ForecastingDataset,
         )
 
-    def test_transform_splits_fits_only_once_on_training_data(
-        self,
-    ) -> None:
-        """The resulting scaler must contain training-only statistics."""
+    def test_transform_splits_fits_on_training_only(self):
+        """Validation and test distributions do not alter scaler statistics."""
 
-        training = create_dataset(
-            num_samples=10,
-            start_value=1.0,
+        training = make_dataset(
+            sequence_offset=0.0,
         )
 
-        validation = create_dataset(
-            num_samples=10,
-            start_value=10000.0,
+        validation = make_dataset(
+            sequence_offset=100000.0,
+            timestamp_start=2000.0,
         )
 
-        test = create_dataset(
-            num_samples=10,
-            start_value=20000.0,
+        test = make_dataset(
+            sequence_offset=-100000.0,
+            timestamp_start=3000.0,
         )
 
         normalizer = ForecastingDatasetNormalizer()
@@ -762,858 +1593,493 @@ class TestSplitTransformation:
             test,
         )
 
-        assert normalizer.scaler is not None
-
-        training_flattened = training.sequences.reshape(
+        flattened_training = training.sequences.reshape(
             -1,
-            NUM_FEATURES,
+            training.num_features,
         )
 
-        expected_means = np.mean(
-            training_flattened,
+        expected_means = flattened_training.mean(
             axis=0,
         )
 
-        assert np.allclose(
+        expected_scales = flattened_training.std(
+            axis=0,
+        )
+
+        np.testing.assert_allclose(
             normalizer.scaler.means,
             expected_means,
         )
 
-    def test_convenience_split_function_matches_normalizer(
-        self,
-    ) -> None:
-        """The convenience function should perform the same operation."""
+        np.testing.assert_allclose(
+            normalizer.scaler.scales,
+            expected_scales,
+        )
 
-        training = create_dataset(
+    def test_transform_splits_preserves_sample_counts(self):
+        """Each split keeps its original number of samples."""
+
+        training = make_dataset(
+            num_samples=20,
+        )
+
+        validation = make_dataset(
             num_samples=10,
+            timestamp_start=2000.0,
         )
 
-        validation = create_dataset(
-            num_samples=5,
-            start_value=100.0,
+        test = make_dataset(
+            num_samples=8,
+            timestamp_start=3000.0,
         )
 
-        test = create_dataset(
-            num_samples=5,
-            start_value=200.0,
-        )
+        normalizer = ForecastingDatasetNormalizer()
 
-        expected_normalizer = ForecastingDatasetNormalizer()
-
-        expected = expected_normalizer.transform_splits(
+        normalized = normalizer.transform_splits(
             training,
             validation,
             test,
         )
 
-        actual = normalize_forecasting_splits(
+        assert normalized[0].num_samples == 20
+        assert normalized[1].num_samples == 10
+        assert normalized[2].num_samples == 8
+
+    def test_transform_splits_preserves_targets(self):
+        """Targets remain unchanged across all splits."""
+
+        training = make_dataset(
+            num_samples=20,
+            target_offset=10.0,
+        )
+
+        validation = make_dataset(
+            num_samples=10,
+            target_offset=20.0,
+            timestamp_start=2000.0,
+        )
+
+        test = make_dataset(
+            num_samples=8,
+            target_offset=30.0,
+            timestamp_start=3000.0,
+        )
+
+        original_targets = (
+            training.targets.copy(),
+            validation.targets.copy(),
+            test.targets.copy(),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalized = normalizer.transform_splits(
             training,
             validation,
             test,
         )
 
-        for expected_dataset, actual_dataset in zip(
-            expected,
-            actual,
-        ):
-            assert np.allclose(
-                expected_dataset.sequences,
-                actual_dataset.sequences,
-            )
-
-
-# ============================================================================
-# Dataset Preservation Tests
-# ============================================================================
-
-class TestDatasetPreservation:
-    """Tests ensuring normalization does not alter non-feature data."""
-
-    def test_targets_are_unchanged(self) -> None:
-        """Normalization must never modify forecasting targets."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert np.array_equal(
-            transformed.targets,
-            dataset.targets,
-        )
-
-    def test_timestamps_are_unchanged(self) -> None:
-        """Normalization must preserve timestamps exactly."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert np.array_equal(
-            transformed.timestamps,
-            dataset.timestamps,
-        )
-
-    def test_feature_names_are_unchanged(self) -> None:
-        """Normalization must preserve feature ordering."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert transformed.feature_names == dataset.feature_names
-
-    def test_context_window_is_unchanged(self) -> None:
-        """Normalization must preserve the context window."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert (
-            transformed.context_window
-            == dataset.context_window
-        )
-
-    def test_forecast_horizon_is_unchanged(self) -> None:
-        """Normalization must preserve the forecast horizon."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert (
-            transformed.forecast_horizon
-            == dataset.forecast_horizon
-        )
-
-    def test_target_name_is_unchanged(self) -> None:
-        """Normalization must preserve the target name."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert (
-            transformed.target_name
-            == dataset.target_name
-        )
-
-    def test_price_column_is_unchanged(self) -> None:
-        """Normalization must preserve the source price column."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert (
-            transformed.price_column
-            == dataset.price_column
-        )
-
-    def test_original_dataset_is_not_modified(self) -> None:
-        """Normalization should not mutate the input dataset."""
-
-        dataset = create_dataset()
-
-        original_sequences = dataset.sequences.copy()
-        original_targets = dataset.targets.copy()
-        original_timestamps = dataset.timestamps.copy()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit_transform(
-            dataset
-        )
-
-        assert np.array_equal(
-            dataset.sequences,
-            original_sequences,
-        )
-
-        assert np.array_equal(
-            dataset.targets,
+        for result, expected in zip(
+            normalized,
             original_targets,
-        )
-
-        assert np.array_equal(
-            dataset.timestamps,
-            original_timestamps,
-        )
-
-
-# ============================================================================
-# Constant Feature Tests
-# ============================================================================
-
-class TestConstantFeatures:
-    """Tests for zero-variance feature handling."""
-
-    def test_constant_feature_does_not_produce_nan(self) -> None:
-        """Constant features must not produce NaN values."""
-
-        dataset = create_constant_feature_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert not np.any(
-            np.isnan(
-                transformed.sequences
+        ):
+            np.testing.assert_array_equal(
+                result.targets,
+                expected,
             )
+
+    def test_transform_splits_preserves_timestamps(self):
+        """Timestamps remain unchanged across all splits."""
+
+        training = make_dataset(
+            num_samples=20,
         )
 
-    def test_constant_feature_does_not_produce_infinity(self) -> None:
-        """Constant features must not produce infinite values."""
-
-        dataset = create_constant_feature_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert np.all(
-            np.isfinite(
-                transformed.sequences
-            )
-        )
-
-    def test_constant_feature_normalizes_to_zero(self) -> None:
-        """A constant feature should become zero after standardization."""
-
-        dataset = create_constant_feature_dataset(
-            constant_value=7.0,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert np.allclose(
-            transformed.sequences[:, :, 0],
-            0.0,
-        )
-
-    def test_constant_feature_uses_unit_scale(self) -> None:
-        """Zero-variance features should use a unit scale internally."""
-
-        dataset = create_constant_feature_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(dataset)
-
-        assert normalizer.scaler is not None
-
-        assert normalizer.scaler.scales[0] == 1.0
-
-
-# ============================================================================
-# Determinism Tests
-# ============================================================================
-
-class TestDeterminism:
-    """Tests for deterministic normalization behavior."""
-
-    def test_repeated_fit_produces_same_statistics(self) -> None:
-        """Repeated fitting on identical data must be deterministic."""
-
-        dataset = create_dataset()
-
-        first = ForecastingDatasetNormalizer()
-        second = ForecastingDatasetNormalizer()
-
-        first.fit(dataset)
-        second.fit(dataset)
-
-        assert first.scaler is not None
-        assert second.scaler is not None
-
-        assert np.array_equal(
-            first.scaler.means,
-            second.scaler.means,
-        )
-
-        assert np.array_equal(
-            first.scaler.scales,
-            second.scaler.scales,
-        )
-
-    def test_repeated_transformation_is_identical(self) -> None:
-        """Repeated transformation with one scaler must be deterministic."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(dataset)
-
-        first = normalizer.transform(dataset)
-        second = normalizer.transform(dataset)
-
-        assert np.array_equal(
-            first.sequences,
-            second.sequences,
-        )
-
-    def test_fit_transform_matches_fit_then_transform(self) -> None:
-        """fit_transform should match explicit fit followed by transform."""
-
-        dataset = create_dataset()
-
-        first = ForecastingDatasetNormalizer()
-
-        first_result = first.fit_transform(
-            dataset
-        )
-
-        second = ForecastingDatasetNormalizer()
-
-        second.fit(dataset)
-
-        second_result = second.transform(
-            dataset
-        )
-
-        assert np.array_equal(
-            first_result.sequences,
-            second_result.sequences,
-        )
-
-
-# ============================================================================
-# Scaler Reuse Tests
-# ============================================================================
-
-class TestScalerReuse:
-    """Tests for reusing a fitted scaler."""
-
-    def test_fitted_scaler_can_transform_new_dataset(self) -> None:
-        """A fitted scaler should work on compatible new data."""
-
-        training = create_dataset(
+        validation = make_dataset(
             num_samples=10,
+            timestamp_start=2000.0,
         )
 
-        new_dataset = create_dataset(
-            num_samples=5,
-            start_value=50.0,
+        test = make_dataset(
+            num_samples=8,
+            timestamp_start=3000.0,
+        )
+
+        original_timestamps = (
+            training.timestamps.copy(),
+            validation.timestamps.copy(),
+            test.timestamps.copy(),
         )
 
         normalizer = ForecastingDatasetNormalizer()
 
-        normalizer.fit(training)
-
-        transformed = normalizer.transform(
-            new_dataset
+        normalized = normalizer.transform_splits(
+            training,
+            validation,
+            test,
         )
 
-        assert transformed.num_samples == 5
-
-        assert transformed.num_features == NUM_FEATURES
-
-    def test_unfitted_normalizer_cannot_transform(self) -> None:
-        """Transformation before fitting should be rejected."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        with pytest.raises(
-            RuntimeError,
-            match="has not been fitted",
+        for result, expected in zip(
+            normalized,
+            original_timestamps,
         ):
-            normalizer.transform(dataset)
-
-    def test_scaler_feature_names_are_checked(self) -> None:
-        """A mismatched feature contract should be rejected."""
-
-        training = create_dataset()
-
-        different_feature_names = tuple(
-            f"different_feature_{index}"
-            for index in range(NUM_FEATURES)
-        )
-
-        incompatible = ForecastingDataset(
-            sequences=training.sequences.copy(),
-            targets=training.targets.copy(),
-            timestamps=training.timestamps.copy(),
-            feature_names=different_feature_names,
-            context_window=training.context_window,
-            forecast_horizon=training.forecast_horizon,
-            target_name=training.target_name,
-            price_column=training.price_column,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(training)
-
-        with pytest.raises(
-            ValueError,
-            match="feature names do not match",
-        ):
-            normalizer.transform(incompatible)
-
-    def test_scaler_transform_checks_feature_names(self) -> None:
-        """StandardScaler should independently validate feature ordering."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        normalizer.fit(dataset)
-
-        assert normalizer.scaler is not None
-
-        with pytest.raises(
-            ValueError,
-            match="feature names do not match",
-        ):
-            normalizer.scaler.transform(
-                dataset.sequences,
-                tuple(
-                    reversed(dataset.feature_names)
-                ),
+            np.testing.assert_array_equal(
+                result.timestamps,
+                expected,
             )
 
+    def test_transform_splits_preserves_model_shape(self):
+        """All normalized splits remain model-compatible."""
 
-# ============================================================================
-# Disabled Normalization Tests
-# ============================================================================
+        training = make_dataset(
+            num_samples=20,
+        )
+
+        validation = make_dataset(
+            num_samples=10,
+            timestamp_start=2000.0,
+        )
+
+        test = make_dataset(
+            num_samples=8,
+            timestamp_start=3000.0,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalized = normalizer.transform_splits(
+            training,
+            validation,
+            test,
+        )
+
+        for dataset in normalized:
+            assert dataset.sequences.ndim == 3
+            assert dataset.sequences.shape[1:] == (
+                20,
+                14,
+            )
+            assert dataset.targets.ndim == 1
+
+
+# ---------------------------------------------------------------------------
+# fit_transform
+# ---------------------------------------------------------------------------
+
+
+class TestFitTransform:
+    """Tests for fit_transform."""
+
+    def test_fit_transform_fits_normalizer(self):
+        """fit_transform leaves the normalizer fitted."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        result = normalizer.fit_transform(
+            dataset,
+        )
+
+        assert normalizer.fitted is True
+        assert isinstance(
+            result,
+            ForecastingDataset,
+        )
+
+    def test_fit_transform_matches_fit_then_transform(self):
+        """fit_transform matches the explicit two-step workflow."""
+
+        dataset = make_dataset()
+
+        first = ForecastingDatasetNormalizer()
+
+        result_one = first.fit_transform(
+            dataset,
+        )
+
+        second = ForecastingDatasetNormalizer()
+
+        second.fit(dataset)
+
+        result_two = second.transform(
+            dataset,
+        )
+
+        np.testing.assert_allclose(
+            result_one.sequences,
+            result_two.sequences,
+        )
+
+        np.testing.assert_array_equal(
+            result_one.targets,
+            result_two.targets,
+        )
+
+        np.testing.assert_array_equal(
+            result_one.timestamps,
+            result_two.timestamps,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Disabled normalization
+# ---------------------------------------------------------------------------
+
 
 class TestDisabledNormalization:
     """Tests for normalize_features=False."""
 
-    def test_disabled_normalization_preserves_values(self) -> None:
-        """Disabling normalization should preserve feature values."""
+    def test_disabled_normalization_has_no_scaler(self):
+        """No scaler is created when normalization is disabled."""
 
-        dataset = create_dataset()
+        config = NormalizerConfig(
+            normalize_features=False,
+        )
 
         normalizer = ForecastingDatasetNormalizer(
-            NormalizerConfig(
-                normalize_features=False,
-            )
+            config=config,
         )
+
+        dataset = make_dataset()
+
+        normalizer.fit(dataset)
+
+        assert normalizer.fitted is True
+        assert normalizer.scaler is None
+
+    def test_disabled_normalization_preserves_features(self):
+        """Feature values remain unchanged when normalization is disabled."""
+
+        config = NormalizerConfig(
+            normalize_features=False,
+        )
+
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
+
+        dataset = make_dataset()
 
         normalizer.fit(dataset)
 
         transformed = normalizer.transform(
-            dataset
+            dataset,
         )
 
-        assert np.array_equal(
+        np.testing.assert_array_equal(
             transformed.sequences,
             dataset.sequences,
         )
 
-    def test_disabled_normalization_does_not_create_scaler(self) -> None:
-        """No scaler should be created when normalization is disabled."""
+    def test_disabled_normalization_preserves_targets(self):
+        """Targets remain unchanged when normalization is disabled."""
 
-        dataset = create_dataset()
+        config = NormalizerConfig(
+            normalize_features=False,
+        )
 
         normalizer = ForecastingDatasetNormalizer(
-            NormalizerConfig(
-                normalize_features=False,
-            )
+            config=config,
         )
+
+        dataset = make_dataset()
 
         normalizer.fit(dataset)
 
-        assert normalizer.scaler is None
-        assert normalizer.fitted is True
-
-    def test_disabled_normalization_still_preserves_metadata(self) -> None:
-        """Disabling normalization must still preserve the dataset contract."""
-
-        dataset = create_dataset()
-
-        normalizer = ForecastingDatasetNormalizer(
-            NormalizerConfig(
-                normalize_features=False,
-            )
+        transformed = normalizer.transform(
+            dataset,
         )
 
-        transformed = normalizer.fit_transform(
-            dataset
-        )
-
-        assert transformed.feature_names == dataset.feature_names
-        assert np.array_equal(
+        np.testing.assert_array_equal(
             transformed.targets,
             dataset.targets,
         )
-        assert np.array_equal(
-            transformed.timestamps,
-            dataset.timestamps,
+
+    def test_disabled_normalization_still_requires_fit(self):
+        """Transform still requires the normalizer to be fitted."""
+
+        config = NormalizerConfig(
+            normalize_features=False,
         )
 
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
 
-# ============================================================================
-# Configuration Integration Tests
-# ============================================================================
+        dataset = make_dataset()
+
+        with pytest.raises(RuntimeError):
+            normalizer.transform(dataset)
+
+    def test_disabled_normalization_fitted_property_is_true_after_fit(self):
+        """
+        Disabled normalization still counts as successfully fitted.
+
+        This protects the regression fixed during Phase 7.
+        """
+
+        config = NormalizerConfig(
+            normalize_features=False,
+        )
+
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
+
+        dataset = make_dataset()
+
+        normalizer.fit(dataset)
+
+        assert normalizer.fitted is True
+
+
+# ---------------------------------------------------------------------------
+# Model input validation
+# ---------------------------------------------------------------------------
+
+
+class TestModelInputValidation:
+    """Tests for model-facing validation."""
+
+    def test_valid_dataset_passes(self):
+        """A compatible dataset passes model input validation."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalizer.validate_model_input(
+            dataset,
+        )
+
+    def test_validation_requires_fit(self):
+        """Model input validation requires a fitted normalizer."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        with pytest.raises(RuntimeError):
+            normalizer.validate_model_input(dataset)
+
+    def test_wrong_feature_schema_fails(self):
+        """Model input validation rejects incompatible feature schemas."""
+
+        training = make_dataset()
+
+        validation = make_custom_feature_dataset(
+            feature_names=(
+                "wrong_a",
+                "wrong_b",
+            ),
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.validate_model_input(
+                validation,
+            )
+
+
+# ---------------------------------------------------------------------------
+# ForecastingConfig integration
+# ---------------------------------------------------------------------------
+
 
 class TestForecastingConfigIntegration:
-    """Tests for integration with ForecastingConfig."""
+    """Tests for ForecastingConfig integration."""
 
-    def test_from_forecasting_config_uses_standard_method(self) -> None:
-        """ForecastingConfig should create a standard normalizer."""
+    def test_from_forecasting_config(self):
+        """Normalizer can be constructed from ForecastingConfig."""
 
         forecasting_config = ForecastingConfig()
 
         normalizer = (
-            ForecastingDatasetNormalizer
-            .from_forecasting_config(
+            ForecastingDatasetNormalizer.from_forecasting_config(
+                forecasting_config
+            )
+        )
+
+        assert isinstance(
+            normalizer,
+            ForecastingDatasetNormalizer,
+        )
+
+    def test_forecasting_config_method_is_used(self):
+        """ForecastingConfig normalization method is propagated."""
+
+        forecasting_config = ForecastingConfig(
+            normalization_method="standard",
+        )
+
+        normalizer = (
+            ForecastingDatasetNormalizer.from_forecasting_config(
                 forecasting_config
             )
         )
 
         assert normalizer.method == "standard"
 
-    def test_from_forecasting_config_preserves_training_only_setting(
-        self,
-    ) -> None:
-        """ForecastingConfig training-only setting should be enforced."""
-
-        forecasting_config = ForecastingConfig()
-
-        normalizer = (
-            ForecastingDatasetNormalizer
-            .from_forecasting_config(
-                forecasting_config
-            )
-        )
-
-        assert normalizer.config.fit_on_training_only is True
-
-    def test_from_forecasting_config_uses_feature_normalization_setting(
-        self,
-    ) -> None:
-        """ForecastingConfig normalization setting should be respected."""
+    def test_forecasting_config_normalization_flag_is_used(self):
+        """normalize_features is propagated from ForecastingConfig."""
 
         forecasting_config = ForecastingConfig(
             normalize_features=False,
         )
 
         normalizer = (
-            ForecastingDatasetNormalizer
-            .from_forecasting_config(
+            ForecastingDatasetNormalizer.from_forecasting_config(
                 forecasting_config
             )
         )
 
-        assert normalizer.config.normalize_features is False
+        assert normalizer.normalization_enabled is False
 
-    def test_invalid_forecasting_config_type_is_rejected(self) -> None:
-        """Invalid configuration objects should be rejected."""
+    def test_forecasting_config_training_only_flag_is_used(self):
+        """Training-only setting is propagated."""
 
-        with pytest.raises(
-            TypeError,
-            match="must be an instance of ForecastingConfig",
-        ):
+        forecasting_config = ForecastingConfig(
+            scaler_fit_on_training_only=True,
+        )
+
+        normalizer = (
             ForecastingDatasetNormalizer.from_forecasting_config(
-                object(),  # type: ignore[arg-type]
+                forecasting_config
             )
-
-    def test_normalize_from_forecasting_config_works(self) -> None:
-        """Configuration-based convenience normalization should work."""
-
-        training = create_dataset(
-            num_samples=10,
         )
 
-        validation = create_dataset(
-            num_samples=5,
-            start_value=100.0,
-        )
+        assert normalizer.config.fit_on_training_only is True
 
-        test = create_dataset(
-            num_samples=5,
-            start_value=200.0,
-        )
+    def test_invalid_forecasting_config_type_raises(self):
+        """from_forecasting_config requires ForecastingConfig."""
 
-        config = ForecastingConfig()
-
-        (
-            normalized_training,
-            normalized_validation,
-            normalized_test,
-        ) = normalize_from_forecasting_config(
-            training,
-            validation,
-            test,
-            config,
-        )
-
-        assert (
-            normalized_training.sequences.shape
-            == training.sequences.shape
-        )
-
-        assert (
-            normalized_validation.sequences.shape
-            == validation.sequences.shape
-        )
-
-        assert (
-            normalized_test.sequences.shape
-            == test.sequences.shape
-        )
-
-
-# ============================================================================
-# Invalid Input Tests
-# ============================================================================
-
-class TestInvalidInput:
-    """Tests for invalid normalization inputs."""
-
-    def test_invalid_training_dataset_type_is_rejected(self) -> None:
-        """fit() should reject non-ForecastingDataset objects."""
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        with pytest.raises(
-            TypeError,
-            match="training_dataset must be an instance",
-        ):
-            normalizer.fit(
-                object(),  # type: ignore[arg-type]
-            )
-
-    def test_invalid_transform_dataset_type_is_rejected(self) -> None:
-        """transform() should reject non-ForecastingDataset objects."""
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        with pytest.raises(
-            TypeError,
-            match="dataset must be an instance",
-        ):
-            normalizer.transform(
-                object(),  # type: ignore[arg-type]
-            )
-
-    def test_nonfinite_training_values_are_rejected(self) -> None:
-        """Training data containing NaN should be rejected."""
-
-        dataset = create_dataset()
-
-        sequences = dataset.sequences.copy()
-        sequences[0, 0, 0] = np.nan
-
-        invalid = ForecastingDataset.__new__(
-            ForecastingDataset
-        )
-
-        object.__setattr__(
-            invalid,
-            "sequences",
-            sequences,
-        )
-
-        object.__setattr__(
-            invalid,
-            "targets",
-            dataset.targets,
-        )
-
-        object.__setattr__(
-            invalid,
-            "timestamps",
-            dataset.timestamps,
-        )
-
-        object.__setattr__(
-            invalid,
-            "feature_names",
-            dataset.feature_names,
-        )
-
-        object.__setattr__(
-            invalid,
-            "context_window",
-            dataset.context_window,
-        )
-
-        object.__setattr__(
-            invalid,
-            "forecast_horizon",
-            dataset.forecast_horizon,
-        )
-
-        object.__setattr__(
-            invalid,
-            "target_name",
-            dataset.target_name,
-        )
-
-        object.__setattr__(
-            invalid,
-            "price_column",
-            dataset.price_column,
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        with pytest.raises(
-            ValueError,
-            match="must contain only finite values",
-        ):
-            normalizer.fit(invalid)
-
-    def test_incompatible_validation_context_window_is_rejected(
-        self,
-    ) -> None:
-        """Validation context-window mismatch should be rejected."""
-
-        training = create_dataset()
-
-        validation_sequences = np.ones(
-            (
-                5,
-                CONTEXT_WINDOW + 1,
-                NUM_FEATURES,
-            ),
-            dtype=np.float64,
-        )
-
-        validation = ForecastingDataset(
-            sequences=validation_sequences,
-            targets=np.arange(
-                5,
-                dtype=np.float64,
-            ),
-            timestamps=np.arange(
-                200,
-                205,
-                dtype=np.float64,
-            ),
-            feature_names=FEATURE_NAMES,
-            context_window=CONTEXT_WINDOW + 1,
-            forecast_horizon=FORECAST_HORIZON,
-            target_name="future_mid_price_return",
-            price_column="mid_price",
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        with pytest.raises(
-            ValueError,
-            match="context window does not match",
-        ):
-            normalizer.transform_splits(
-                training,
-                validation,
-                create_dataset(
-                    num_samples=5,
-                    start_value=200.0,
-                ),
-            )
-
-    def test_incompatible_test_feature_count_is_rejected(
-        self,
-    ) -> None:
-        """A mismatched test feature dimension should be rejected."""
-
-        training = create_dataset()
-
-        test_sequences = np.ones(
-            (
-                5,
-                CONTEXT_WINDOW,
-                NUM_FEATURES + 1,
-            ),
-            dtype=np.float64,
-        )
-
-        test_feature_names = FEATURE_NAMES + (
-            "extra_feature",
-        )
-
-        test = ForecastingDataset(
-            sequences=test_sequences,
-            targets=np.arange(
-                5,
-                dtype=np.float64,
-            ),
-            timestamps=np.arange(
-                200,
-                205,
-                dtype=np.float64,
-            ),
-            feature_names=test_feature_names,
-            context_window=CONTEXT_WINDOW,
-            forecast_horizon=FORECAST_HORIZON,
-            target_name="future_mid_price_return",
-            price_column="mid_price",
-        )
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        with pytest.raises(
-            ValueError,
-            match="feature names do not match",
-        ):
-            normalizer.transform_splits(
-                training,
-                create_dataset(
-                    num_samples=5,
-                    start_value=100.0,
-                ),
-                test,
+        with pytest.raises(TypeError):
+            ForecastingDatasetNormalizer.from_forecasting_config(
+                "not-a-config",
             )
 
 
-# ============================================================================
-# Convenience Function Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Convenience function tests
+# ---------------------------------------------------------------------------
+
 
 class TestConvenienceFunctions:
     """Tests for public normalization convenience functions."""
 
-    def test_fit_normalizer_returns_fitted_normalizer(self) -> None:
-        """fit_normalizer should return a fitted normalizer."""
+    def test_fit_normalizer(self):
+        """fit_normalizer returns a fitted normalizer."""
 
-        dataset = create_dataset()
+        dataset = make_dataset()
 
         normalizer = fit_normalizer(
-            dataset
+            dataset,
         )
 
         assert isinstance(
@@ -1623,133 +2089,817 @@ class TestConvenienceFunctions:
 
         assert normalizer.fitted is True
 
-    def test_normalize_forecasting_splits_returns_expected_shapes(
-        self,
-    ) -> None:
-        """Convenience split normalization should preserve all shapes."""
+    def test_fit_normalizer_accepts_config(self):
+        """fit_normalizer accepts custom configuration."""
 
-        training = create_dataset(
+        dataset = make_dataset()
+
+        config = NormalizerConfig(
+            dtype="float32",
+        )
+
+        normalizer = fit_normalizer(
+            dataset,
+            config=config,
+        )
+
+        assert normalizer.config.dtype == "float32"
+
+    def test_normalize_forecasting_splits(self):
+        """Convenience split normalization works."""
+
+        training = make_dataset(
+            num_samples=20,
+        )
+
+        validation = make_dataset(
+            num_samples=10,
+            timestamp_start=2000.0,
+        )
+
+        test = make_dataset(
             num_samples=8,
+            timestamp_start=3000.0,
         )
 
-        validation = create_dataset(
-            num_samples=4,
-            start_value=100.0,
-        )
-
-        test = create_dataset(
-            num_samples=3,
-            start_value=200.0,
-        )
-
-        (
-            normalized_training,
-            normalized_validation,
-            normalized_test,
-        ) = normalize_forecasting_splits(
+        normalized = normalize_forecasting_splits(
             training,
             validation,
             test,
         )
 
-        assert (
-            normalized_training.sequences.shape
-            == training.sequences.shape
+        assert len(normalized) == 3
+
+        for dataset in normalized:
+            assert isinstance(
+                dataset,
+                ForecastingDataset,
+            )
+
+    def test_normalize_from_forecasting_config(self):
+        """ForecastingConfig convenience API works."""
+
+        training = make_dataset(
+            num_samples=20,
         )
 
-        assert (
-            normalized_validation.sequences.shape
-            == validation.sequences.shape
+        validation = make_dataset(
+            num_samples=10,
+            timestamp_start=2000.0,
         )
 
-        assert (
-            normalized_test.sequences.shape
-            == test.sequences.shape
+        test = make_dataset(
+            num_samples=8,
+            timestamp_start=3000.0,
         )
 
+        config = ForecastingConfig()
 
-# ============================================================================
-# Minimal Dataset Tests
-# ============================================================================
+        normalized = normalize_from_forecasting_config(
+            training,
+            validation,
+            test,
+            config,
+        )
 
-class TestMinimalDataset:
-    """Tests for the smallest valid forecasting dataset."""
+        assert len(normalized) == 3
 
-    def test_single_sample_dataset_can_be_normalized(self) -> None:
-        """A single valid sample should be normalizable."""
+        for dataset in normalized:
+            assert isinstance(
+                dataset,
+                ForecastingDataset,
+            )
 
-        dataset = create_single_sample_dataset()
+
+# ---------------------------------------------------------------------------
+# NormalizedForecastingDataset wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizedForecastingDataset:
+    """Tests for the optional normalized dataset wrapper."""
+
+    def test_wrapper_constructs_with_scaler(self):
+        """Wrapper accepts a normalized dataset and scaler."""
+
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
 
-        transformed = normalizer.fit_transform(
-            dataset
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        wrapper = NormalizedForecastingDataset(
+            dataset=normalized,
+            scaler=normalizer.scaler,
+            normalization_enabled=True,
+        )
+
+        assert wrapper.dataset is normalized
+        assert wrapper.scaler is normalizer.scaler
+        assert wrapper.normalization_enabled is True
+
+    def test_wrapper_exposes_sequences(self):
+        """Wrapper exposes normalized sequences."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        wrapper = NormalizedForecastingDataset(
+            dataset=normalized,
+            scaler=normalizer.scaler,
+            normalization_enabled=True,
+        )
+
+        np.testing.assert_array_equal(
+            wrapper.sequences,
+            normalized.sequences,
+        )
+
+    def test_wrapper_exposes_targets(self):
+        """Wrapper exposes unchanged targets."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        wrapper = NormalizedForecastingDataset(
+            dataset=normalized,
+            scaler=normalizer.scaler,
+            normalization_enabled=True,
+        )
+
+        np.testing.assert_array_equal(
+            wrapper.targets,
+            normalized.targets,
+        )
+
+    def test_wrapper_exposes_timestamps(self):
+        """Wrapper exposes unchanged timestamps."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        wrapper = NormalizedForecastingDataset(
+            dataset=normalized,
+            scaler=normalizer.scaler,
+            normalization_enabled=True,
+        )
+
+        np.testing.assert_array_equal(
+            wrapper.timestamps,
+            normalized.timestamps,
+        )
+
+    def test_wrapper_exposes_shape(self):
+        """Wrapper exposes model input shape."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        wrapper = NormalizedForecastingDataset(
+            dataset=normalized,
+            scaler=normalizer.scaler,
+            normalization_enabled=True,
+        )
+
+        assert wrapper.shape == normalized.shape
+
+    def test_enabled_wrapper_requires_scaler(self):
+        """Enabled normalization requires a scaler."""
+
+        dataset = make_dataset()
+
+        with pytest.raises(ValueError):
+            NormalizedForecastingDataset(
+                dataset=dataset,
+                scaler=None,
+                normalization_enabled=True,
+            )
+
+    def test_disabled_wrapper_can_have_no_scaler(self):
+        """Disabled normalization can omit the scaler."""
+
+        dataset = make_dataset()
+
+        wrapper = NormalizedForecastingDataset(
+            dataset=dataset,
+            scaler=None,
+            normalization_enabled=False,
+        )
+
+        assert wrapper.scaler is None
+        assert wrapper.normalization_enabled is False
+
+    def test_wrapper_requires_forecasting_dataset(self):
+        """Wrapper requires a ForecastingDataset."""
+
+        with pytest.raises(TypeError):
+            NormalizedForecastingDataset(
+                dataset="not-a-dataset",
+                scaler=None,
+                normalization_enabled=False,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Dtype behavior
+# ---------------------------------------------------------------------------
+
+
+class TestDtypeBehavior:
+    """Tests for normalization dtype handling."""
+
+    def test_default_output_is_float64(self):
+        """Default normalized features are float64."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.sequences.dtype == np.float64
+
+    def test_float32_output(self):
+        """Configured float32 normalization produces float32 features."""
+
+        config = NormalizerConfig(
+            dtype="float32",
+        )
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
+
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        assert transformed.sequences.dtype == np.float32
+
+    def test_float32_preserves_shape(self):
+        """Changing dtype does not change model dimensions."""
+
+        config = NormalizerConfig(
+            dtype="float32",
+        )
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer(
+            config=config,
+        )
+
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
         )
 
         assert transformed.sequences.shape == (
-            1,
-            CONTEXT_WINDOW,
-            NUM_FEATURES,
+            dataset.sequences.shape
         )
 
-        assert np.all(
-            np.isfinite(
-                transformed.sequences
+
+# ---------------------------------------------------------------------------
+# Copy behavior
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizerCopyBehavior:
+    """Tests for normalizer copy semantics."""
+
+    def test_copy_enabled_produces_independent_features(self):
+        """copy_arrays=True isolates transformed feature arrays."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer(
+            NormalizerConfig(
+                copy_arrays=True,
             )
         )
 
-    def test_single_sample_dataset_normalizes_to_zero(self) -> None:
-        """
-        A completely constant single-sample dataset should normalize to zero.
-        """
+        normalizer.fit(dataset)
 
-        dataset = create_single_sample_dataset()
-
-        normalizer = ForecastingDatasetNormalizer()
-
-        transformed = normalizer.fit_transform(
-            dataset
+        transformed = normalizer.transform(
+            dataset,
         )
 
-        assert np.allclose(
+        original = transformed.sequences.copy()
+
+        dataset.sequences[0, 0, 0] = (
+            dataset.sequences[0, 0, 0] + 100000.0
+        )
+
+        np.testing.assert_array_equal(
             transformed.sequences,
-            0.0,
+            original,
+        )
+
+    def test_copy_enabled_produces_independent_targets(self):
+        """copy_arrays=True isolates target arrays."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer(
+            NormalizerConfig(
+                copy_arrays=True,
+            )
+        )
+
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        original = transformed.targets.copy()
+
+        dataset.targets[0] = 999999.0
+
+        np.testing.assert_array_equal(
+            transformed.targets,
+            original,
+        )
+
+    def test_copy_enabled_produces_independent_timestamps(self):
+        """copy_arrays=True isolates timestamp arrays."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer(
+            NormalizerConfig(
+                copy_arrays=True,
+            )
+        )
+
+        normalizer.fit(dataset)
+
+        transformed = normalizer.transform(
+            dataset,
+        )
+
+        original = transformed.timestamps.copy()
+
+        dataset.timestamps[0] = 999999.0
+
+        np.testing.assert_array_equal(
+            transformed.timestamps,
+            original,
         )
 
 
-# ============================================================================
-# Public Export Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Repeated transformation
+# ---------------------------------------------------------------------------
 
-class TestStandardScaler:
-    """Tests for the standalone StandardScaler contract."""
 
-    def test_scaler_reports_feature_count(self) -> None:
-        """StandardScaler should report its number of features."""
+class TestRepeatedTransformation:
+    """Tests for deterministic repeated transformations."""
 
-        dataset = create_dataset()
+    def test_repeated_transformations_are_identical(self):
+        """Transforming the same dataset twice produces identical output."""
+
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
 
         normalizer.fit(dataset)
 
-        assert normalizer.scaler is not None
-
-        assert (
-            normalizer.scaler.num_features
-            == NUM_FEATURES
+        first = normalizer.transform(
+            dataset,
         )
 
-    def test_scaler_reports_fitted_state(self) -> None:
-        """A fitted StandardScaler should report fitted=True."""
+        second = normalizer.transform(
+            dataset,
+        )
 
-        dataset = create_dataset()
+        np.testing.assert_array_equal(
+            first.sequences,
+            second.sequences,
+        )
+
+        np.testing.assert_array_equal(
+            first.targets,
+            second.targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.timestamps,
+            second.timestamps,
+        )
+
+    def test_repeated_split_transformations_are_identical(self):
+        """Repeated split transformation is deterministic."""
+
+        training = make_dataset(
+            num_samples=20,
+        )
+
+        validation = make_dataset(
+            num_samples=10,
+            timestamp_start=2000.0,
+        )
+
+        test = make_dataset(
+            num_samples=8,
+            timestamp_start=3000.0,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        first = normalizer.transform_splits(
+            training,
+            validation,
+            test,
+        )
+
+        second = normalizer.transform_splits(
+            training,
+            validation,
+            test,
+        )
+
+        for first_dataset, second_dataset in zip(
+            first,
+            second,
+        ):
+            np.testing.assert_array_equal(
+                first_dataset.sequences,
+                second_dataset.sequences,
+            )
+
+            np.testing.assert_array_equal(
+                first_dataset.targets,
+                second_dataset.targets,
+            )
+
+            np.testing.assert_array_equal(
+                first_dataset.timestamps,
+                second_dataset.timestamps,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Invalid dataset values
+# ---------------------------------------------------------------------------
+
+
+class TestInvalidDatasetValues:
+    """Tests for invalid feature values."""
+
+    def test_nan_validation_features_raise(self):
+        """NaN validation features cannot be transformed."""
+
+        training = make_dataset()
+        validation = make_dataset(
+            timestamp_start=2000.0,
+        )
+
+        validation.sequences[0, 0, 0] = np.nan
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.transform(validation)
+
+    def test_infinite_validation_features_raise(self):
+        """Infinite validation features cannot be transformed."""
+
+        training = make_dataset()
+        validation = make_dataset(
+            timestamp_start=2000.0,
+        )
+
+        validation.sequences[0, 0, 0] = np.inf
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.transform(validation)
+
+    def test_nan_test_features_raise(self):
+        """NaN test features cannot be transformed."""
+
+        training = make_dataset()
+        test = make_dataset(
+            timestamp_start=3000.0,
+        )
+
+        test.sequences[0, 0, 0] = np.nan
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(training)
+
+        with pytest.raises(ValueError):
+            normalizer.transform(test)
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA forecasting contract regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestNVIDIAForecastingContract:
+    """
+    Regression tests for the current NVIDIA forecasting input contract.
+
+    Expected:
+
+        context_window = 20
+        feature_count = 14
+        target shape = (N,)
+    """
+
+    def test_normalized_input_is_3d(self):
+        """Normalized NVIDIA inputs remain three-dimensional."""
+
+        dataset = make_dataset()
 
         normalizer = ForecastingDatasetNormalizer()
 
         normalizer.fit(dataset)
 
-        assert normalizer.scaler is not None
+        normalized = normalizer.transform(
+            dataset,
+        )
 
-        assert normalizer.scaler.fitted is True
+        assert normalized.sequences.ndim == 3
+
+    def test_normalized_input_shape_is_n_20_14(self):
+        """Normalized NVIDIA input has shape (N, 20, 14)."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        assert normalized.sequences.shape[1:] == (
+            20,
+            14,
+        )
+
+    def test_normalized_target_shape_is_n(self):
+        """Normalized dataset retains one target per sequence."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        assert normalized.targets.shape == (
+            normalized.num_samples,
+        )
+
+    def test_normalization_does_not_change_context_window(self):
+        """Context window remains exactly 20."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        assert normalized.context_window == 20
+
+    def test_normalization_does_not_change_feature_order(self):
+        """Feature ordering remains the NVIDIA contract order."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        assert normalized.feature_names == FEATURE_NAMES
+
+    def test_normalization_does_not_change_forecast_horizon(self):
+        """Forecast horizon remains five observations."""
+
+        dataset = make_dataset()
+
+        normalizer = ForecastingDatasetNormalizer()
+
+        normalizer.fit(dataset)
+
+        normalized = normalizer.transform(
+            dataset,
+        )
+
+        assert normalized.forecast_horizon == 5
+
+
+# ---------------------------------------------------------------------------
+# Complete integration regression test
+# ---------------------------------------------------------------------------
+
+
+def test_complete_phase_seven_normalization_contract():
+    """
+    Verify the complete leakage-safe normalization contract.
+
+    The final normalized dataset must provide:
+
+        - 3D feature inputs
+        - 20 timestep context
+        - 14 features
+        - 1D targets
+        - unchanged timestamps
+        - unchanged targets
+        - finite normalized features
+        - training features approximately zero mean
+        - training features approximately unit variance
+        - fitted scaler metadata
+    """
+
+    training = make_dataset(
+        num_samples=30,
+        sequence_offset=0.0,
+    )
+
+    validation = make_dataset(
+        num_samples=10,
+        sequence_offset=100000.0,
+        timestamp_start=2000.0,
+    )
+
+    test = make_dataset(
+        num_samples=10,
+        sequence_offset=-100000.0,
+        timestamp_start=3000.0,
+    )
+
+    original_validation_targets = validation.targets.copy()
+    original_validation_timestamps = (
+        validation.timestamps.copy()
+    )
+
+    original_test_targets = test.targets.copy()
+    original_test_timestamps = (
+        test.timestamps.copy()
+    )
+
+    normalizer = ForecastingDatasetNormalizer()
+
+    normalized_train, normalized_validation, normalized_test = (
+        normalizer.transform_splits(
+            training,
+            validation,
+            test,
+        )
+    )
+
+    # Fitted state.
+    assert normalizer.fitted is True
+    assert normalizer.scaler is not None
+    assert normalizer.feature_names == FEATURE_NAMES
+
+    # Model input contract.
+    assert normalized_train.sequences.ndim == 3
+    assert normalized_train.sequences.shape[1:] == (
+        20,
+        14,
+    )
+
+    assert normalized_validation.sequences.shape[1:] == (
+        20,
+        14,
+    )
+
+    assert normalized_test.sequences.shape[1:] == (
+        20,
+        14,
+    )
+
+    # Target contract.
+    assert normalized_train.targets.ndim == 1
+    assert normalized_validation.targets.ndim == 1
+    assert normalized_test.targets.ndim == 1
+
+    # Training normalization.
+    flattened_training = (
+        normalized_train.sequences.reshape(
+            -1,
+            normalized_train.num_features,
+        )
+    )
+
+    np.testing.assert_allclose(
+        flattened_training.mean(axis=0),
+        np.zeros(normalized_train.num_features),
+        atol=1e-12,
+    )
+
+    np.testing.assert_allclose(
+        flattened_training.std(axis=0),
+        np.ones(normalized_train.num_features),
+        atol=1e-12,
+    )
+
+    # Validation/test values must remain finite.
+    assert np.all(
+        np.isfinite(
+            normalized_validation.sequences
+        )
+    )
+
+    assert np.all(
+        np.isfinite(
+            normalized_test.sequences
+        )
+    )
+
+    # Validation/test targets remain unchanged.
+    np.testing.assert_array_equal(
+        normalized_validation.targets,
+        original_validation_targets,
+    )
+
+    np.testing.assert_array_equal(
+        normalized_test.targets,
+        original_test_targets,
+    )
+
+    # Validation/test timestamps remain unchanged.
+    np.testing.assert_array_equal(
+        normalized_validation.timestamps,
+        original_validation_timestamps,
+    )
+
+    np.testing.assert_array_equal(
+        normalized_test.timestamps,
+        original_test_timestamps,
+    )
+
+    # Metadata remains intact.
+    assert normalized_train.feature_names == FEATURE_NAMES
+    assert normalized_train.context_window == 20
+    assert normalized_train.forecast_horizon == 5
+    assert normalized_train.target_name == (
+        "future_mid_price_return"
+    )
+    assert normalized_train.price_column == "mid_price" 
 

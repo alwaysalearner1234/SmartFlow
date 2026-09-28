@@ -962,33 +962,28 @@ class TestInputValidation:
             )
 
     def test_empty_dataset_raises(self) -> None:
-        """Empty datasets cannot be split."""
+        """An empty forecasting dataset cannot be constructed."""
 
-        dataset = ForecastingDataset(
-            sequences=np.empty(
-                (0, CONTEXT_WINDOW, len(FEATURE_NAMES)),
-                dtype=np.float64,
-            ),
-            targets=np.empty(
-                0,
-                dtype=np.float64,
-            ),
-            timestamps=np.empty(
-                0,
-                dtype=np.float64,
-            ),
-            feature_names=FEATURE_NAMES,
-            context_window=CONTEXT_WINDOW,
-            forecast_horizon=FORECAST_HORIZON,
-            target_name=TARGET_NAME,
-            price_column=PRICE_COLUMN,
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="Cannot split an empty",
-        ):
-            split_forecasting_dataset(dataset)
+        with pytest.raises(ValueError, match="at least one sample"):
+            ForecastingDataset(
+                sequences=np.empty(
+                    (0, CONTEXT_WINDOW, len(FEATURE_NAMES)),
+                    dtype=np.float64,
+                ),
+                targets=np.empty(
+                    0,
+                    dtype=np.float64,
+                ),
+                timestamps=np.empty(
+                    0,
+                    dtype=np.float64,
+                ),
+                feature_names=FEATURE_NAMES,
+                context_window=CONTEXT_WINDOW,
+                forecast_horizon=FORECAST_HORIZON,
+                target_name=TARGET_NAME,
+                price_column=PRICE_COLUMN,
+            )
 
 
 # =============================================================================

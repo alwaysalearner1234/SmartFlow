@@ -1,42 +1,81 @@
-# normalizer.py
+"""
+data/normalizer.py
 
-# Forecasting Feature Normalization Module for SmartFlow
+Training-only feature normalization for forecasting datasets.
 
-# Provides training-only normalization for the forecasting pipeline.
-#
-# This module intentionally operates on the existing ForecastingDataset
-# contract and does not contain model-training or model-inference logic.
-#
-# The scaler is fitted exclusively on the training dataset and can then
-# be reused to transform validation, test, and later inference data.
-#
-# The normalization process preserves:
-#
-#     - sequence shape
-#     - target values
-#     - timestamps
-#     - feature ordering
-#     - forecasting metadata
-#
-# The default normalization method is standardization:
-#
-#     normalized_value = (value - mean) / standard_deviation
-#
-# For sequence data with shape:
-#
-#     (num_samples, context_window, num_features)
-#
-# scaler statistics are learned independently for each feature across all
-# training observations and all positions inside the context windows.
-#
-# This module is designed to prevent temporal leakage. Validation and test
-# observations are never used when fitting the scaler.
+This module provides the normalization layer between the chronological
+forecasting dataset pipeline and downstream machine-learning models.
 
+The normalization pipeline is intentionally strict:
+
+    ForecastingDataset
+        -> Training Split
+        -> Fit Scaler on Training Features Only
+        -> Transform Training Features
+        -> Transform Validation Features
+        -> Transform Test Features
+        -> NVIDIA Forecasting Model
+
+The most important rule in this module is leakage prevention:
+
+    The scaler MUST be fitted using training data only.
+
+Validation and test data are transformed using the statistics learned from
+the training split. Their statistics must never influence the fitted scaler.
+
+Current normalization support:
+    - Standard normalization
+
+Standard normalization:
+
+    normalized_value = (value - mean) / scale
+
+where mean and scale are calculated independently for each feature using
+training samples and all timesteps inside each context window.
+
+Expected model input shape:
+
+    (num_samples, context_window, num_features)
+
+For the current NVIDIA forecasting contract:
+
+    context_window = 20
+    num_features = 14
+
+Therefore a typical model input has shape:
+
+    (N, 20, 14)
+
+Targets remain unchanged by normalization and retain shape:
+
+    (N,)
+
+This module is responsible for:
+    - validating forecasting datasets
+    - fitting feature normalization parameters
+    - enforcing training-only scaler fitting
+    - transforming datasets
+    - transforming train/validation/test splits consistently
+    - preserving forecasting metadata
+    - exposing fitted scaler information
+    - supporting the ForecastingConfig contract
+
+This module does not:
+    - build feature sequences
+    - build forecast targets
+    - align sequences and targets
+    - split chronological datasets
+    - train machine-learning models
+    - perform model inference
+    - normalize target values
+    - modify timestamps
+    - modify feature names
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -44,21 +83,20 @@ from config.config import ForecastingConfig
 from data.forecasting_dataset import ForecastingDataset
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # Constants
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 DEFAULT_NORMALIZATION_METHOD = "standard"
+SUPPORTED_NORMALIZATION_METHODS = ("standard",)
+
+DEFAULT_DTYPE = "float64"
 
 
-SUPPORTED_NORMALIZATION_METHODS = (
-    "standard",
-)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-
-# ============================================================================
-# Normalization Configuration
-# ============================================================================
 
 @dataclass(frozen=True)
 class NormalizerConfig:
@@ -69,230 +107,230 @@ class NormalizerConfig:
         method:
             Normalization method to use.
 
-            Currently supported:
-
-                "standard"
-
         normalize_features:
-            If True, feature values are normalized.
-
-            If False, the input dataset is returned unchanged except for
-            defensive copying.
+            Whether feature normalization is enabled.
 
         fit_on_training_only:
-            If True, the normalizer is explicitly configured for training-only
-            scaler fitting.
-
-            This is the required setting for the forecasting pipeline.
+            Whether scaler statistics must be learned from training data
+            only. This should remain True for leakage-safe forecasting.
 
         dtype:
-            NumPy dtype used for normalized feature arrays.
+            NumPy dtype used for transformed feature arrays.
 
         copy_arrays:
-            If True, transformed arrays are copied instead of sharing memory
-            with the source dataset.
+            Whether transformed arrays should be independent copies rather
+            than views into the original dataset.
     """
 
     method: str = DEFAULT_NORMALIZATION_METHOD
     normalize_features: bool = True
     fit_on_training_only: bool = True
-    dtype: str = "float64"
+    dtype: str = DEFAULT_DTYPE
     copy_arrays: bool = True
 
+    def __post_init__(self) -> None:
+        """Validate normalization configuration."""
 
-# ============================================================================
-# Validation Helpers
-# ============================================================================
+        if not isinstance(self.method, str):
+            raise TypeError("method must be a string.")
+
+        normalized_method = self.method.strip().lower()
+
+        if normalized_method not in SUPPORTED_NORMALIZATION_METHODS:
+            raise ValueError(
+                f"Unsupported normalization method: {self.method!r}. "
+                f"Supported methods: {SUPPORTED_NORMALIZATION_METHODS}."
+            )
+
+        if not isinstance(self.normalize_features, bool):
+            raise TypeError("normalize_features must be a boolean.")
+
+        if not isinstance(self.fit_on_training_only, bool):
+            raise TypeError("fit_on_training_only must be a boolean.")
+
+        if not isinstance(self.dtype, str) or not self.dtype.strip():
+            raise ValueError("dtype must be a non-empty string.")
+
+        try:
+            np.dtype(self.dtype)
+        except TypeError as exc:
+            raise ValueError(f"Invalid NumPy dtype: {self.dtype!r}.") from exc
+
+        if not isinstance(self.copy_arrays, bool):
+            raise TypeError("copy_arrays must be a boolean.")
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
 
 def _validate_method(method: str) -> str:
     """
-    Validate and normalize the configured normalization method.
-
-    Args:
-        method:
-            Normalization method name.
-
-    Returns:
-        Lowercase normalization method.
-
-    Raises:
-        ValueError:
-            If the method is empty or unsupported.
+    Normalize and validate a normalization method name.
     """
 
     if not isinstance(method, str):
-        raise TypeError(
-            "Normalization method must be a string."
-        )
+        raise TypeError("Normalization method must be a string.")
 
     normalized_method = method.strip().lower()
 
-    if not normalized_method:
-        raise ValueError(
-            "Normalization method must not be empty."
-        )
-
     if normalized_method not in SUPPORTED_NORMALIZATION_METHODS:
         raise ValueError(
-            "Unsupported normalization method: "
-            f"{method!r}. Supported methods are: "
-            f"{SUPPORTED_NORMALIZATION_METHODS}."
+            f"Unsupported normalization method: {method!r}. "
+            f"Supported methods: {SUPPORTED_NORMALIZATION_METHODS}."
         )
 
     return normalized_method
 
 
+def _validate_dtype(dtype: str) -> np.dtype:
+    """
+    Validate and return a NumPy dtype.
+    """
+
+    if not isinstance(dtype, str) or not dtype.strip():
+        raise ValueError("dtype must be a non-empty string.")
+
+    try:
+        return np.dtype(dtype)
+    except TypeError as exc:
+        raise ValueError(f"Invalid NumPy dtype: {dtype!r}.") from exc
+
+
 def _validate_dataset(
     dataset: ForecastingDataset,
-    dataset_name: str,
+    *,
+    name: str = "dataset",
 ) -> None:
     """
-    Validate that the supplied object is a forecasting dataset.
-
-    ForecastingDataset performs its own structural validation. This helper
-    provides an explicit type boundary for the normalizer.
-
-    Args:
-        dataset:
-            Dataset to validate.
-
-        dataset_name:
-            Human-readable name used in error messages.
-
-    Raises:
-        TypeError:
-            If the supplied object is not a ForecastingDataset.
-
-        ValueError:
-            If the dataset contains no samples.
+    Validate that an object is a usable ForecastingDataset.
     """
 
     if not isinstance(dataset, ForecastingDataset):
         raise TypeError(
-            f"{dataset_name} must be an instance of ForecastingDataset."
+            f"{name} must be a ForecastingDataset, "
+            f"got {type(dataset).__name__}."
         )
 
-    if dataset.num_samples == 0:
+    if dataset.sequences.ndim != 3:
         raise ValueError(
-            f"{dataset_name} must contain at least one sample."
+            f"{name}.sequences must be 3-dimensional. "
+            f"Got shape {dataset.sequences.shape}."
         )
+
+    if dataset.targets.ndim != 1:
+        raise ValueError(
+            f"{name}.targets must be 1-dimensional. "
+            f"Got shape {dataset.targets.shape}."
+        )
+
+    if dataset.timestamps.ndim != 1:
+        raise ValueError(
+            f"{name}.timestamps must be 1-dimensional. "
+            f"Got shape {dataset.timestamps.shape}."
+        )
+
+    if dataset.sequences.shape[0] != dataset.targets.shape[0]:
+        raise ValueError(
+            f"{name} sequence/target sample counts do not match."
+        )
+
+    if dataset.sequences.shape[0] != dataset.timestamps.shape[0]:
+        raise ValueError(
+            f"{name} sequence/timestamp sample counts do not match."
+        )
+
+    if dataset.sequences.shape[0] == 0:
+        raise ValueError(f"{name} must contain at least one sample.")
 
 
 def _validate_sequence_values(
-    sequences: np.ndarray,
-    dataset_name: str,
+    dataset: ForecastingDataset,
+    *,
+    name: str = "dataset",
 ) -> None:
     """
-    Validate the numerical values of a sequence tensor.
-
-    Args:
-        sequences:
-            Three-dimensional feature tensor.
-
-        dataset_name:
-            Human-readable dataset name for error messages.
-
-    Raises:
-        ValueError:
-            If the sequence tensor is not numeric, three-dimensional,
-            or contains non-finite values.
+    Validate feature values before fitting or transforming.
     """
 
-    sequences = np.asarray(sequences)
+    try:
+        values = np.asarray(dataset.sequences, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"{name}.sequences must contain numeric feature values."
+        ) from exc
 
-    if sequences.ndim != 3:
+    if values.ndim != 3:
         raise ValueError(
-            f"{dataset_name} sequences must be three-dimensional."
+            f"{name}.sequences must be 3-dimensional. "
+            f"Got shape {values.shape}."
         )
 
-    if not np.issubdtype(sequences.dtype, np.number):
+    if np.any(np.isinf(values)):
         raise ValueError(
-            f"{dataset_name} sequences must contain numeric values."
+            f"{name}.sequences contains infinite feature values."
         )
 
-    if not np.all(np.isfinite(sequences)):
+    if np.any(np.isnan(values)):
         raise ValueError(
-            f"{dataset_name} sequences must contain only finite values."
+            f"{name}.sequences contains NaN feature values. "
+            "Normalization requires complete numeric feature sequences."
         )
 
 
 def _validate_feature_compatibility(
-    reference_dataset: ForecastingDataset,
+    expected_names: Sequence[str],
     dataset: ForecastingDataset,
-    dataset_name: str,
+    *,
+    name: str = "dataset",
 ) -> None:
     """
-    Validate that two forecasting datasets use the same feature contract.
-
-    Args:
-        reference_dataset:
-            Dataset whose feature contract is considered authoritative.
-
-        dataset:
-            Dataset being compared against the reference.
-
-        dataset_name:
-            Human-readable name for the dataset being validated.
-
-    Raises:
-        ValueError:
-            If feature names, context window, or feature dimensions differ.
+    Ensure a dataset contains the exact feature schema used during fitting.
     """
 
-    if tuple(dataset.feature_names) != tuple(
-        reference_dataset.feature_names
-    ):
-        raise ValueError(
-            f"{dataset_name} feature names do not match the training "
-            "feature contract."
-        )
+    expected = tuple(expected_names)
+    actual = tuple(dataset.feature_names)
 
-    if dataset.context_window != reference_dataset.context_window:
+    if actual != expected:
         raise ValueError(
-            f"{dataset_name} context window does not match the training "
-            "dataset."
-        )
-
-    if dataset.num_features != reference_dataset.num_features:
-        raise ValueError(
-            f"{dataset_name} feature count does not match the training "
-            "dataset."
+            f"{name} feature schema does not match the fitted scaler. "
+            f"Expected {expected}, got {actual}."
         )
 
 
-def _validate_dtype(dtype: str) -> None:
+def _validate_training_only_requirement(
+    config: NormalizerConfig,
+) -> None:
     """
-    Validate the requested NumPy dtype.
-
-    Args:
-        dtype:
-            NumPy dtype string.
-
-    Raises:
-        TypeError:
-            If the dtype cannot be interpreted by NumPy.
+    Ensure leakage-safe training-only fitting is enabled.
     """
 
-    try:
-        np.dtype(dtype)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"Invalid normalization dtype: {dtype!r}."
-        ) from exc
+    if not config.fit_on_training_only:
+        raise ValueError(
+            "fit_on_training_only must be True for the forecasting "
+            "normalization pipeline. Fitting normalization statistics "
+            "using validation or test data would introduce data leakage."
+        )
 
 
-# ============================================================================
-# Standard Scaler
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Standard scaler
+# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class StandardScaler:
     """
-    Lightweight feature-wise standard scaler.
+    Fitted per-feature standard normalization parameters.
 
-    The scaler stores one mean and one standard deviation for each feature.
+    The scaler stores one mean and one scale for every feature.
 
-    Statistics are fitted from the training dataset only.
+    Statistics are learned across:
+        - all training samples
+        - all context-window timesteps
+
+    They are NOT learned independently per timestep.
 
     Attributes:
         means:
@@ -302,10 +340,7 @@ class StandardScaler:
             Per-feature standard deviations.
 
         feature_names:
-            Ordered feature names used during fitting.
-
-        fitted:
-            Indicates whether valid training statistics are available.
+            Feature names in the exact order used during fitting.
     """
 
     means: np.ndarray
@@ -313,190 +348,231 @@ class StandardScaler:
     feature_names: Tuple[str, ...]
 
     def __post_init__(self) -> None:
-        """Validate stored scaler statistics."""
+        """Validate fitted scaler parameters."""
 
-        means = np.asarray(self.means)
-        scales = np.asarray(self.scales)
+        means = np.asarray(self.means, dtype=np.float64)
+        scales = np.asarray(self.scales, dtype=np.float64)
 
         if means.ndim != 1:
-            raise ValueError(
-                "Scaler means must be one-dimensional."
-            )
+            raise ValueError("means must be a 1-dimensional array.")
 
         if scales.ndim != 1:
+            raise ValueError("scales must be a 1-dimensional array.")
+
+        if means.shape != scales.shape:
             raise ValueError(
-                "Scaler scales must be one-dimensional."
+                "means and scales must have identical shapes."
             )
 
-        if len(means) != len(scales):
+        if means.size == 0:
+            raise ValueError("Scaler must contain at least one feature.")
+
+        if len(self.feature_names) != means.size:
             raise ValueError(
-                "Scaler means and scales must contain the same number "
-                "of features."
+                "Number of feature names must match scaler statistics."
             )
 
-        if len(means) != len(self.feature_names):
+        if any(
+            not isinstance(name, str) or not name.strip()
+            for name in self.feature_names
+        ):
             raise ValueError(
-                "Scaler statistics must match the number of feature names."
-            )
-
-        if not self.feature_names:
-            raise ValueError(
-                "Scaler must contain at least one feature."
+                "feature_names must contain non-empty strings."
             )
 
         if len(set(self.feature_names)) != len(self.feature_names):
             raise ValueError(
-                "Scaler feature names must be unique."
-            )
-
-        if not np.issubdtype(means.dtype, np.number):
-            raise ValueError(
-                "Scaler means must be numeric."
-            )
-
-        if not np.issubdtype(scales.dtype, np.number):
-            raise ValueError(
-                "Scaler scales must be numeric."
+                "feature_names must contain unique feature names."
             )
 
         if not np.all(np.isfinite(means)):
-            raise ValueError(
-                "Scaler means must contain only finite values."
-            )
+            raise ValueError("means must contain only finite values.")
 
         if not np.all(np.isfinite(scales)):
-            raise ValueError(
-                "Scaler scales must contain only finite values."
-            )
+            raise ValueError("scales must contain only finite values.")
 
         if np.any(scales <= 0):
-            raise ValueError(
-                "Scaler scales must be greater than zero."
-            )
+            raise ValueError("All scaler scales must be greater than zero.")
+
+        object.__setattr__(self, "means", means)
+        object.__setattr__(self, "scales", scales)
+        object.__setattr__(
+            self,
+            "feature_names",
+            tuple(self.feature_names),
+        )
 
     @property
     def num_features(self) -> int:
-        """Return the number of features represented by the scaler."""
+        """Return the number of normalized features."""
 
-        return int(len(self.feature_names))
+        return int(self.means.shape[0])
 
     @property
     def fitted(self) -> bool:
-        """Return True because this object represents fitted statistics."""
+        """Return whether the scaler contains fitted statistics."""
 
         return True
 
     def transform(
         self,
         sequences: np.ndarray,
-        feature_names: Tuple[str, ...],
+        *,
+        dtype: str = DEFAULT_DTYPE,
+        copy: bool = True,
     ) -> np.ndarray:
         """
-        Transform feature sequences using the stored training statistics.
+        Normalize a 3D sequence array using fitted statistics.
 
-        Args:
-            sequences:
-                Three-dimensional feature tensor with shape:
+        Expected input shape:
 
-                    (num_samples, context_window, num_features)
-
-            feature_names:
-                Ordered feature names corresponding to the final axis.
+            (samples, context_window, num_features)
 
         Returns:
-            Standardized feature tensor.
-
-        Raises:
-            ValueError:
-                If the input feature contract does not match the scaler.
+            Normalized sequence array with identical shape.
         """
 
-        sequences = np.asarray(sequences)
+        values = np.asarray(sequences, dtype=np.float64)
 
-        _validate_sequence_values(
-            sequences,
-            "Input",
-        )
-
-        if sequences.shape[2] != self.num_features:
+        if values.ndim != 3:
             raise ValueError(
-                "Input feature dimension does not match the fitted scaler."
+                "sequences must be 3-dimensional. "
+                f"Got shape {values.shape}."
             )
 
-        if tuple(feature_names) != tuple(self.feature_names):
+        if values.shape[-1] != self.num_features:
             raise ValueError(
-                "Input feature names do not match the fitted scaler."
+                "Sequence feature count does not match the fitted scaler. "
+                f"Expected {self.num_features}, "
+                f"got {values.shape[-1]}."
             )
 
-        means = np.asarray(
-            self.means,
-            dtype=sequences.dtype,
-        )
-
-        scales = np.asarray(
-            self.scales,
-            dtype=sequences.dtype,
-        )
-
-        transformed = (
-            sequences - means.reshape(1, 1, -1)
-        ) / scales.reshape(1, 1, -1)
-
-        if not np.all(np.isfinite(transformed)):
+        if np.any(np.isnan(values)):
             raise ValueError(
-                "Normalization produced non-finite values."
+                "sequences contains NaN values and cannot be normalized."
             )
 
-        return transformed
+        if np.any(np.isinf(values)):
+            raise ValueError(
+                "sequences contains infinite values and cannot be normalized."
+            )
+
+        normalized = (
+            values - self.means.reshape(1, 1, -1)
+        ) / self.scales.reshape(1, 1, -1)
+
+        result_dtype = _validate_dtype(dtype)
+
+        if copy:
+            return np.array(
+                normalized,
+                dtype=result_dtype,
+                copy=True,
+            )
+
+        return normalized.astype(result_dtype, copy=False)
 
 
-# ============================================================================
-# Normalization Result
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Normalized dataset wrapper
+# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class NormalizedForecastingDataset:
     """
-    Result of normalizing a ForecastingDataset.
+    Optional wrapper containing a normalized dataset and its fitted scaler.
 
-    This wrapper retains the normalized dataset and the scaler used to
-    transform it.
+    This wrapper is useful when callers need both the transformed dataset and
+    the exact normalization parameters used to create it.
 
-    Attributes:
-        dataset:
-            ForecastingDataset containing normalized feature sequences.
-
-        scaler:
-            Training-fitted scaler used for the transformation.
-
-        normalized:
-            Indicates whether feature normalization was applied.
+    The underlying ForecastingDataset remains the primary public dataset
+    contract.
     """
 
     dataset: ForecastingDataset
     scaler: Optional[StandardScaler]
-    normalized: bool
+    normalization_enabled: bool
+
+    def __post_init__(self) -> None:
+        """Validate normalized dataset wrapper."""
+
+        if not isinstance(self.dataset, ForecastingDataset):
+            raise TypeError(
+                "dataset must be a ForecastingDataset."
+            )
+
+        if not isinstance(self.normalization_enabled, bool):
+            raise TypeError(
+                "normalization_enabled must be a boolean."
+            )
+
+        if self.normalization_enabled and self.scaler is None:
+            raise ValueError(
+                "A scaler is required when normalization is enabled."
+            )
+
+    @property
+    def shape(self) -> tuple:
+        """Return the normalized feature sequence shape."""
+
+        return self.dataset.shape
+
+    @property
+    def sequences(self) -> np.ndarray:
+        """Return normalized feature sequences."""
+
+        return self.dataset.sequences
+
+    @property
+    def targets(self) -> np.ndarray:
+        """Return unchanged forecasting targets."""
+
+        return self.dataset.targets
+
+    @property
+    def timestamps(self) -> np.ndarray:
+        """Return unchanged sequence-end timestamps."""
+
+        return self.dataset.timestamps
 
 
-# ============================================================================
-# Forecasting Dataset Normalizer
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Forecasting dataset normalizer
+# ---------------------------------------------------------------------------
+
 
 class ForecastingDatasetNormalizer:
     """
-    Normalize forecasting features using training-only statistics.
+    Fit and apply leakage-safe feature normalization.
 
-    The normalizer has two distinct operations:
+    Typical usage:
 
-        1. fit()
-            Learn normalization statistics from training data.
+        normalizer = ForecastingDatasetNormalizer.from_forecasting_config(
+            forecasting_config
+        )
 
-        2. transform()
-            Apply already-fitted statistics to a forecasting dataset.
+        normalizer.fit(train_dataset)
 
-    This separation is intentional.
+        train_normalized = normalizer.transform(train_dataset)
+        validation_normalized = normalizer.transform(validation_dataset)
+        test_normalized = normalizer.transform(test_dataset)
 
-    Validation and test data must never be passed to fit().
+    Or:
+
+        train_normalized, validation_normalized, test_normalized = (
+            normalizer.transform_splits(
+                train_dataset,
+                validation_dataset,
+                test_dataset,
+            )
+        )
+
+    Important:
+        Calling fit() on the training split is the intended workflow.
+
+    The normalizer stores no target statistics because targets are not
+    normalized in this forecasting pipeline.
     """
 
     def __init__(
@@ -505,35 +581,28 @@ class ForecastingDatasetNormalizer:
     ) -> None:
         """
         Initialize the forecasting dataset normalizer.
-
-        Args:
-            config:
-                Optional normalization configuration.
         """
 
         self.config = config or NormalizerConfig()
 
-        self._method = _validate_method(
-            self.config.method
-        )
-
-        _validate_dtype(
-            self.config.dtype
-        )
-
-        if not self.config.fit_on_training_only:
-            raise ValueError(
-                "fit_on_training_only must be True for the forecasting "
-                "pipeline."
-            )
+        _validate_method(self.config.method)
+        _validate_dtype(self.config.dtype)
 
         self._scaler: Optional[StandardScaler] = None
         self._training_feature_names: Optional[Tuple[str, ...]] = None
         self._fitted = False
 
-    # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Properties
-    # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+
+    @property
+    def fitted(self) -> bool:
+        """
+        Return whether the fit operation has completed successfully.
+        """
+
+        return self._fitted
 
     @property
     def scaler(self) -> Optional[StandardScaler]:
@@ -541,32 +610,36 @@ class ForecastingDatasetNormalizer:
         Return the fitted scaler.
 
         Returns:
-            Fitted StandardScaler, or None if fit() has not been called.
+            StandardScaler when normalization is enabled and fitted.
+
+            None when normalization is disabled.
         """
 
         return self._scaler
 
     @property
-    def fitted(self) -> bool:
-        """Return whether the fit operation has completed successfully."""
-
-        return self._fitted 
-
-    @property
-    def method(self) -> str:
-        """Return the configured normalization method."""
-
-        return self._method
-
-    @property
     def feature_names(self) -> Optional[Tuple[str, ...]]:
-        """Return the feature contract learned during fitting."""
+        """
+        Return the feature schema used during fitting.
+        """
 
         return self._training_feature_names
 
-    # ------------------------------------------------------------------------
-    # Fit
-    # ------------------------------------------------------------------------
+    @property
+    def method(self) -> str:
+        """Return the active normalization method."""
+
+        return _validate_method(self.config.method)
+
+    @property
+    def normalization_enabled(self) -> bool:
+        """Return whether feature normalization is enabled."""
+
+        return self.config.normalize_features
+
+    # ------------------------------------------------------------------
+    # Fitting
+    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -575,210 +648,185 @@ class ForecastingDatasetNormalizer:
         """
         Fit normalization statistics using training data only.
 
-        The context-window and sample dimensions are flattened temporarily
-        so that one statistic is learned independently for each feature.
+        For standard normalization, each feature's mean and standard
+        deviation are calculated over every training sample and every
+        timestep in its context window.
 
-        For input shape:
-
-            (samples, context_window, features)
-
-        fitting operates conceptually on:
-
-            (samples * context_window, features)
-
-        Validation and test datasets are intentionally not accepted here.
-
-        When feature normalization is disabled, no scaler is created, but
-        the normalizer is still marked as fitted so that the fitted state
-        consistently represents completion of the fit operation.
+        No validation or test data is accepted by this method.
 
         Args:
             training_dataset:
-                Training-only forecasting dataset.
+                Chronological training ForecastingDataset.
 
         Returns:
             This normalizer instance.
 
         Raises:
-            TypeError:
-                If training_dataset is not a ForecastingDataset.
-
             ValueError:
-                If the training data is invalid or contains non-finite
-                values.
+                If the training dataset is invalid or contains invalid
+                feature values.
         """
+
+        _validate_training_only_requirement(self.config)
 
         _validate_dataset(
             training_dataset,
-            "training_dataset",
+            name="training_dataset",
         )
 
         _validate_sequence_values(
-            training_dataset.sequences,
-            "Training",
+            training_dataset,
+            name="training_dataset",
         )
 
-        feature_names = tuple(
-            training_dataset.feature_names
-        )
+        feature_names = tuple(training_dataset.feature_names)
 
-        if self.config.normalize_features:
-            flattened = np.asarray(
-                training_dataset.sequences,
-                dtype=self.config.dtype,
-            ).reshape(
-                -1,
-                training_dataset.num_features,
+        if not feature_names:
+            raise ValueError(
+                "training_dataset must contain at least one feature."
             )
 
-            if self._method == "standard":
-                means = np.mean(
-                    flattened,
-                    axis=0,
-                    dtype=np.float64,
-                )
+        self._training_feature_names = feature_names
 
-                scales = np.std(
-                    flattened,
-                    axis=0,
-                    dtype=np.float64,
-                )
+        if not self.config.normalize_features:
+            self._scaler = None
+            self._fitted = True
+            return self
 
-                # Constant features have zero variance. They are assigned
-                # a unit scale so that their normalized values become zero
-                # instead of producing division-by-zero values.
-                scales = np.where(
-                    scales == 0.0,
-                    1.0,
-                    scales,
-                )
+        method = _validate_method(self.config.method)
 
-            else:
+        if method == "standard":
+            values = np.asarray(
+                training_dataset.sequences,
+                dtype=np.float64,
+            )
+
+            # Collapse samples and context timesteps while preserving
+            # the final feature dimension.
+            flattened = values.reshape(-1, values.shape[-1])
+
+            means = np.mean(flattened, axis=0)
+            scales = np.std(
+                flattened,
+                axis=0,
+                ddof=0,
+            )
+
+            if not np.all(np.isfinite(means)):
                 raise ValueError(
-                    f"Unsupported normalization method: {self._method!r}."
+                    "Training feature means contain non-finite values."
                 )
+
+            if not np.all(np.isfinite(scales)):
+                raise ValueError(
+                    "Training feature scales contain non-finite values."
+                )
+
+            # A constant feature contains no useful variance but should
+            # remain usable. A scale of 1 preserves the centered value
+            # without causing division by zero.
+            scales = np.where(scales == 0.0, 1.0, scales)
 
             self._scaler = StandardScaler(
-                means=np.asarray(
-                    means,
-                    dtype=self.config.dtype,
-                ),
-                scales=np.asarray(
-                    scales,
-                    dtype=self.config.dtype,
-                ),
+                means=means,
+                scales=scales,
                 feature_names=feature_names,
             )
 
         else:
-            # Normalization is intentionally disabled. No scaler is
-            # required, but fit() has still successfully completed.
-            self._scaler = None
+            raise ValueError(
+                f"Unsupported normalization method: {method!r}."
+            )
 
-        self._training_feature_names = feature_names
         self._fitted = True
 
         return self
 
-    # ------------------------------------------------------------------------
-    # Transform
-    # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Transformation
+    # ------------------------------------------------------------------
 
     def transform(
         self,
         dataset: ForecastingDataset,
     ) -> ForecastingDataset:
         """
-        Transform a forecasting dataset using fitted training statistics.
+        Transform a ForecastingDataset using fitted training statistics.
 
-        This method does not fit or modify the scaler.
+        The feature schema must exactly match the schema used during fit.
 
-        Therefore it can safely be called for:
-
-            - training data
-            - validation data
-            - test data
-            - later inference data
-
-        provided that the feature contract is compatible.
+        Targets and timestamps are copied unchanged.
 
         Args:
             dataset:
-                Forecasting dataset to transform.
+                Dataset to transform.
 
         Returns:
-            ForecastingDataset with normalized feature sequences.
-
-        Raises:
-            RuntimeError:
-                If normalization is enabled but fit() has not been called.
-
-            TypeError:
-                If dataset is not a ForecastingDataset.
-
-            ValueError:
-                If dataset's feature contract is incompatible with the
-                training feature contract.
+            A new ForecastingDataset containing normalized feature
+            sequences and unchanged targets/timestamps.
         """
 
-        _validate_dataset(
-            dataset,
-            "dataset",
-        )
+        if not self._fitted:
+            raise RuntimeError(
+                "Normalizer has not been fitted. Call fit() using the "
+                "training dataset before transforming data."
+            )
 
-        _validate_sequence_values(
-            dataset.sequences,
-            "Dataset",
-        )
+        _validate_dataset(dataset)
+        _validate_sequence_values(dataset)
 
         if self._training_feature_names is None:
             raise RuntimeError(
-                "The normalizer has not been fitted. "
-                "Call fit() using the training dataset first."
+                "Normalizer is marked as fitted but has no training "
+                "feature schema."
             )
 
-        if tuple(dataset.feature_names) != tuple(
-            self._training_feature_names
-        ):
-            raise ValueError(
-                "Dataset feature names do not match the fitted training "
-                "feature contract."
-            )
+        _validate_feature_compatibility(
+            self._training_feature_names,
+            dataset,
+        )
 
         if self.config.normalize_features:
             if self._scaler is None:
                 raise RuntimeError(
-                    "The normalizer has no fitted scaler. "
-                    "Call fit() using the training dataset first."
+                    "Normalizer is marked as fitted but has no scaler."
                 )
 
             normalized_sequences = self._scaler.transform(
-                np.asarray(
-                    dataset.sequences,
-                    dtype=self.config.dtype,
-                ),
-                tuple(dataset.feature_names),
+                dataset.sequences,
+                dtype=self.config.dtype,
+                copy=self.config.copy_arrays,
             )
 
         else:
+            dtype = _validate_dtype(self.config.dtype)
+
             normalized_sequences = np.asarray(
                 dataset.sequences,
-                dtype=self.config.dtype,
+                dtype=dtype,
             )
 
+            if self.config.copy_arrays:
+                normalized_sequences = normalized_sequences.copy()
+
+        targets = np.asarray(
+            dataset.targets,
+            dtype=dtype if not self.config.normalize_features else np.float64,
+        )
+
+        timestamps = np.asarray(
+            dataset.timestamps,
+            dtype=np.float64,
+        )
+
         if self.config.copy_arrays:
-            normalized_sequences = normalized_sequences.copy()
+            targets = targets.copy()
+            timestamps = timestamps.copy()
 
         return ForecastingDataset(
             sequences=normalized_sequences,
-            targets=np.asarray(
-                dataset.targets,
-                dtype=self.config.dtype,
-            ).copy(),
-            timestamps=np.asarray(
-                dataset.timestamps,
-                dtype=self.config.dtype,
-            ).copy(),
+            targets=targets,
+            timestamps=timestamps,
             feature_names=tuple(dataset.feature_names),
             context_window=dataset.context_window,
             forecast_horizon=dataset.forecast_horizon,
@@ -786,38 +834,28 @@ class ForecastingDatasetNormalizer:
             price_column=dataset.price_column,
         )
 
-    # ------------------------------------------------------------------------
-    # Fit and Transform Training Data
-    # ------------------------------------------------------------------------
-
     def fit_transform(
         self,
         training_dataset: ForecastingDataset,
     ) -> ForecastingDataset:
         """
-        Fit the scaler on training data and transform that same training data.
+        Fit using training data and immediately transform it.
 
-        This is the intended operation for the training partition.
+        This is equivalent to:
 
-        Args:
-            training_dataset:
-                Training-only forecasting dataset.
+            normalizer.fit(training_dataset)
+            normalizer.transform(training_dataset)
 
-        Returns:
-            Normalized training dataset.
+        The scaler is fitted before transformation and therefore does not
+        introduce leakage from validation or test data.
         """
 
-        self.fit(
-            training_dataset
-        )
+        self.fit(training_dataset)
+        return self.transform(training_dataset)
 
-        return self.transform(
-            training_dataset
-        )
-
-    # ------------------------------------------------------------------------
-    # Transform Split
-    # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Split transformation
+    # ------------------------------------------------------------------
 
     def transform_splits(
         self,
@@ -830,61 +868,69 @@ class ForecastingDatasetNormalizer:
         ForecastingDataset,
     ]:
         """
-        Fit on training data and transform all three dataset partitions.
+        Fit on training data and transform all three forecasting splits.
 
-        The scaler is fitted exactly once using the training dataset.
+        This is the preferred high-level API for the forecasting pipeline.
 
-        Validation and test datasets are only transformed. Their statistics
-        never influence the fitted scaler.
+        The order of operations is strictly:
 
-        Args:
-            training_dataset:
-                Chronological training partition.
+            1. Validate train/validation/test.
+            2. Fit scaler using training only.
+            3. Transform training.
+            4. Transform validation using training statistics.
+            5. Transform test using training statistics.
 
-            validation_dataset:
-                Chronological validation partition.
-
-            test_dataset:
-                Chronological test partition.
+        Validation and test distributions never influence the fitted scaler.
 
         Returns:
             Tuple containing:
 
-                normalized_training,
-                normalized_validation,
-                normalized_test
+                normalized_training_dataset
+                normalized_validation_dataset
+                normalized_test_dataset
         """
 
         _validate_dataset(
             training_dataset,
-            "training_dataset",
+            name="training_dataset",
         )
-
         _validate_dataset(
             validation_dataset,
-            "validation_dataset",
+            name="validation_dataset",
         )
-
         _validate_dataset(
             test_dataset,
-            "test_dataset",
+            name="test_dataset",
+        )
+
+        _validate_sequence_values(
+            training_dataset,
+            name="training_dataset",
+        )
+        _validate_sequence_values(
+            validation_dataset,
+            name="validation_dataset",
+        )
+        _validate_sequence_values(
+            test_dataset,
+            name="test_dataset",
+        )
+
+        feature_names = tuple(training_dataset.feature_names)
+
+        _validate_feature_compatibility(
+            feature_names,
+            validation_dataset,
+            name="validation_dataset",
         )
 
         _validate_feature_compatibility(
-            training_dataset,
-            validation_dataset,
-            "Validation dataset",
-        )
-
-        _validate_feature_compatibility(
-            training_dataset,
+            feature_names,
             test_dataset,
-            "Test dataset",
+            name="test_dataset",
         )
 
-        self.fit(
-            training_dataset
-        )
+        self.fit(training_dataset)
 
         normalized_training = self.transform(
             training_dataset
@@ -904,9 +950,66 @@ class ForecastingDatasetNormalizer:
             normalized_test,
         )
 
-    # ------------------------------------------------------------------------
-    # Configuration Integration
-    # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Model-facing validation
+    # ------------------------------------------------------------------
+
+    def validate_model_input(
+        self,
+        dataset: ForecastingDataset,
+    ) -> None:
+        """
+        Validate that a dataset is compatible with the fitted normalizer.
+
+        This method verifies the model-facing feature schema and shape
+        without modifying the dataset.
+
+        The expected shape is:
+
+            (N, context_window, num_features)
+
+        where N may differ between train, validation, and test.
+        """
+
+        _validate_dataset(dataset)
+
+        if not self._fitted:
+            raise RuntimeError(
+                "Normalizer has not been fitted."
+            )
+
+        if self._training_feature_names is None:
+            raise RuntimeError(
+                "Fitted normalizer has no feature schema."
+            )
+
+        _validate_feature_compatibility(
+            self._training_feature_names,
+            dataset,
+        )
+
+        if dataset.context_window <= 0:
+            raise ValueError(
+                "Dataset context_window must be positive."
+            )
+
+        expected_features = len(self._training_feature_names)
+
+        if dataset.num_features != expected_features:
+            raise ValueError(
+                "Dataset feature count does not match the fitted "
+                f"normalization schema. Expected {expected_features}, "
+                f"got {dataset.num_features}."
+            )
+
+        if dataset.targets.ndim != 1:
+            raise ValueError(
+                "Forecasting targets must remain 1-dimensional."
+            )
+
+    # ------------------------------------------------------------------
+    # Configuration integration
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_forecasting_config(
@@ -914,18 +1017,14 @@ class ForecastingDatasetNormalizer:
         forecasting_config: ForecastingConfig,
     ) -> "ForecastingDatasetNormalizer":
         """
-        Create a normalizer from ForecastingConfig.
+        Construct a normalizer from the project's ForecastingConfig.
 
-        Args:
-            forecasting_config:
-                Existing forecasting configuration.
+        The ForecastingConfig controls whether normalization is enabled,
+        which method is used, and whether scaler fitting is restricted to
+        training data.
 
-        Returns:
-            Configured ForecastingDatasetNormalizer.
-
-        Raises:
-            TypeError:
-                If the supplied configuration is not a ForecastingConfig.
+        The project's leakage-safe contract requires
+        scaler_fit_on_training_only=True.
         """
 
         if not isinstance(
@@ -933,53 +1032,37 @@ class ForecastingDatasetNormalizer:
             ForecastingConfig,
         ):
             raise TypeError(
-                "forecasting_config must be an instance of "
-                "ForecastingConfig."
+                "forecasting_config must be a ForecastingConfig."
             )
 
-        return cls(
-            config=NormalizerConfig(
-                method=forecasting_config.normalization_method,
-                normalize_features=(
-                    forecasting_config.normalize_features
-                ),
-                fit_on_training_only=(
-                    forecasting_config.scaler_fit_on_training_only
-                ),
-            )
+        config = NormalizerConfig(
+            method=forecasting_config.normalization_method,
+            normalize_features=forecasting_config.normalize_features,
+            fit_on_training_only=(
+                forecasting_config.scaler_fit_on_training_only
+            ),
         )
 
+        return cls(config=config)
 
-# ============================================================================
-# Convenience Functions
-# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Convenience functions
+# ---------------------------------------------------------------------------
+
 
 def fit_normalizer(
     training_dataset: ForecastingDataset,
     config: Optional[NormalizerConfig] = None,
 ) -> ForecastingDatasetNormalizer:
     """
-    Fit a forecasting normalizer using training data only.
+    Fit a leakage-safe normalizer on a training dataset.
 
-    Args:
-        training_dataset:
-            Training forecasting dataset.
-
-        config:
-            Optional normalization configuration.
-
-    Returns:
-        Fitted ForecastingDatasetNormalizer.
+    This is a convenience wrapper around ForecastingDatasetNormalizer.fit().
     """
 
-    normalizer = ForecastingDatasetNormalizer(
-        config=config,
-    )
-
-    normalizer.fit(
-        training_dataset
-    )
-
+    normalizer = ForecastingDatasetNormalizer(config=config)
+    normalizer.fit(training_dataset)
     return normalizer
 
 
@@ -994,33 +1077,18 @@ def normalize_forecasting_splits(
     ForecastingDataset,
 ]:
     """
-    Fit normalization on training data and transform all partitions.
+    Fit on training data and normalize train/validation/test splits.
 
-    Args:
-        training_dataset:
-            Training forecasting dataset.
-
-        validation_dataset:
-            Validation forecasting dataset.
-
-        test_dataset:
-            Test forecasting dataset.
-
-        config:
-            Optional normalization configuration.
-
-    Returns:
-        Tuple containing normalized training, validation, and test datasets.
+    This is the recommended convenience function for the complete
+    normalization stage of the forecasting pipeline.
     """
 
-    normalizer = ForecastingDatasetNormalizer(
-        config=config,
-    )
+    normalizer = ForecastingDatasetNormalizer(config=config)
 
     return normalizer.transform_splits(
-        training_dataset=training_dataset,
-        validation_dataset=validation_dataset,
-        test_dataset=test_dataset,
+        training_dataset,
+        validation_dataset,
+        test_dataset,
     )
 
 
@@ -1035,25 +1103,7 @@ def normalize_from_forecasting_config(
     ForecastingDataset,
 ]:
     """
-    Normalize forecasting partitions using ForecastingConfig.
-
-    The scaler is fitted exclusively on the training dataset.
-
-    Args:
-        training_dataset:
-            Training forecasting dataset.
-
-        validation_dataset:
-            Validation forecasting dataset.
-
-        test_dataset:
-            Test forecasting dataset.
-
-        forecasting_config:
-            Existing forecasting configuration.
-
-    Returns:
-        Tuple containing normalized training, validation, and test datasets.
+    Normalize forecasting splits using the project's ForecastingConfig.
     """
 
     normalizer = ForecastingDatasetNormalizer.from_forecasting_config(
@@ -1061,22 +1111,24 @@ def normalize_from_forecasting_config(
     )
 
     return normalizer.transform_splits(
-        training_dataset=training_dataset,
-        validation_dataset=validation_dataset,
-        test_dataset=test_dataset,
+        training_dataset,
+        validation_dataset,
+        test_dataset,
     )
 
 
-# ============================================================================
-# Public Exports
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Public exports
+# ---------------------------------------------------------------------------
+
 
 __all__ = [
     "DEFAULT_NORMALIZATION_METHOD",
     "SUPPORTED_NORMALIZATION_METHODS",
+    "DEFAULT_DTYPE",
     "NormalizerConfig",
-    "NormalizedForecastingDataset",
     "StandardScaler",
+    "NormalizedForecastingDataset",
     "ForecastingDatasetNormalizer",
     "fit_normalizer",
     "normalize_forecasting_splits",
