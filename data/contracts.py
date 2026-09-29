@@ -1804,6 +1804,109 @@ def validate_forecasting_dataset_contract(
 
 
 # =============================================================================
+# Execution Context Contract
+# =============================================================================
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    """
+    Unified execution context passed between pipeline stages.
+
+    Combines adverse-selection risk, NVIDIA forecast, Almgren-Chriss schedule
+    data, and market microstructure features into a single immutable record
+    used by the dynamic execution engine and proposed strategy.
+
+    Invariants:
+        - has_valid_forecast: forecast is not None and its model_status is in
+          {TRAINED, SUCCESS, READY} and forecast.timestamp <= context timestamp
+          (guards against future-data leakage).
+        - is_ml_fallback: adverse_risk model_status is FALLBACK or
+          FALLBACK_HEURISTIC (indicates no trained model available).
+    """
+
+    timestamp: float
+    remaining_quantity: float
+    initial_quantity: float
+    elapsed_time: float
+    total_horizon: float
+    urgency: float
+    ac_slice_quantity: float
+    ac_expected_cost: float
+    ac_schedule_index: int
+    adverse_risk: PredictionResult
+    forecast: Optional[ForecastResult] = None
+    spread_bps: Optional[float] = None
+    top_of_book_depth: Optional[float] = None
+    volatility: Optional[float] = None
+
+    @property
+    def has_valid_forecast(self) -> bool:
+        """
+        Return True if the forecast is available, structurally valid, and not
+        stale (no future-data leakage).
+
+        A forecast is valid when:
+            - it is not None,
+            - its model_status is one of {TRAINED, SUCCESS, READY}, and
+            - its timestamp does not exceed the execution context timestamp.
+        """
+        if self.forecast is None:
+            return False
+        if self.forecast.model_status not in {ModelStatus.TRAINED, ModelStatus.SUCCESS, ModelStatus.READY}:
+            return False
+        return self.forecast.timestamp <= self.timestamp
+
+    @property
+    def is_ml_fallback(self) -> bool:
+        """
+        Return True if the adverse-selection model is in a fallback/heuristic
+        state, meaning no trained model is available.
+        """
+        return self.adverse_risk.model_status in {ModelStatus.FALLBACK, ModelStatus.FALLBACK_HEURISTIC}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialise the execution context to a dictionary for the API/dashboard.
+
+        Returns a plain dict with all fields; Optional fields that are None
+        are omitted from the returned mapping.
+        """
+        d: Dict[str, Any] = {
+            "timestamp": self.timestamp,
+            "remaining_quantity": self.remaining_quantity,
+            "initial_quantity": self.initial_quantity,
+            "elapsed_time": self.elapsed_time,
+            "total_horizon": self.total_horizon,
+            "urgency": self.urgency,
+            "ac_slice_quantity": self.ac_slice_quantity,
+            "ac_expected_cost": self.ac_expected_cost,
+            "ac_schedule_index": self.ac_schedule_index,
+            "adverse_risk_probability": self.adverse_risk.probability,
+            "adverse_risk_model_status_label": self.adverse_risk.model_status,
+            "adverse_risk_model_name": self.adverse_risk.model_name,
+        }
+        if self.forecast is not None:
+            d["forecast_predicted_return"] = self.forecast.predicted_return
+            d["forecast_model_status"] = self.forecast.model_status
+            d["forecast_model_name"] = self.forecast.model_name
+            d["forecast_horizon"] = self.forecast.forecast_horizon
+            d["forecast_timestamp"] = self.forecast.timestamp
+        else:
+            d["forecast_predicted_return"] = None
+            d["forecast_model_status"] = None
+            d["forecast_model_name"] = None
+            d["forecast_horizon"] = None
+            d["forecast_timestamp"] = None
+        if self.spread_bps is not None:
+            d["spread_bps"] = self.spread_bps
+        if self.top_of_book_depth is not None:
+            d["top_of_book_depth"] = self.top_of_book_depth
+        if self.volatility is not None:
+            d["volatility"] = self.volatility
+        return d
+
+
+# =============================================================================
 # Public Module API
 # =============================================================================
 
@@ -1860,5 +1963,10 @@ __all__ = [
     "SequenceDataset",
     "TargetDataset",
     "ForecastingDataset",
+
+    # -------------------------------------------------------------------------
+    # Execution context contract
+    # -------------------------------------------------------------------------
+    "ExecutionContext",
 ] 
 
