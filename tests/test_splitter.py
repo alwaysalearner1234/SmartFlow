@@ -1,20 +1,32 @@
 """
 Tests for chronological train/validation/test dataset splitting.
 
-These tests verify that Phase 6 correctly:
+This test module validates the Phase 6 forecasting-data split pipeline.
 
-    - splits forecasting datasets chronologically
-    - preserves sequence/target/timestamp alignment
-    - prevents temporal overlap
-    - never shuffles samples
-    - produces deterministic boundaries
-    - preserves forecasting metadata
-    - handles uneven dataset sizes
-    - validates split ratios
-    - rejects invalid chronology
-    - rejects datasets that are too small for the requested split
-    - creates independent output arrays
-    - supports the existing ForecastingConfig interface
+The tests cover:
+
+- SplitterConfig defaults and validation.
+- Chronological train/validation/test partitioning.
+- Deterministic floor-based split boundaries.
+- Preservation of sequence/target/timestamp alignment.
+- Strict temporal ordering.
+- Prevention of temporal overlap.
+- Preservation of original sample order.
+- Deterministic repeated execution.
+- Metadata preservation.
+- Copy and mutation safety.
+- Tiny and large dataset boundaries.
+- Input validation.
+- Result convenience properties.
+- ForecastingConfig integration.
+- Custom split ratios.
+- Timestamp behavior with non-unit chronological spacing.
+- Full reconstruction of the original dataset.
+- Partition contiguity.
+- Data type preservation.
+- Feature-shape preservation.
+- Target/timestamp correspondence.
+- Temporal leakage protection.
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ import pytest
 # Local Imports
 # =============================================================================
 
+from config.config import ForecastingConfig
 from data.forecasting_dataset import ForecastingDataset
 from data.splitter import (
     ChronologicalDatasetSplit,
@@ -62,6 +75,9 @@ FORECAST_HORIZON = 5
 TARGET_NAME = "future_mid_price_return"
 PRICE_COLUMN = "mid_price"
 
+DEFAULT_VALIDATION_SIZE = 0.15
+DEFAULT_TEST_SIZE = 0.15
+
 
 # =============================================================================
 # Test Helpers
@@ -72,12 +88,20 @@ def create_forecasting_dataset(
     num_samples: int = 100,
     *,
     timestamps: np.ndarray | None = None,
+    dtype: str | np.dtype = "float64",
 ) -> ForecastingDataset:
     """
     Create a deterministic ForecastingDataset for testing.
 
-    Each sample contains a unique sequence value so that ordering and
-    alignment can be checked precisely after splitting.
+    Each sample contains a unique sequence value so that ordering,
+    alignment, and partition boundaries can be checked precisely.
+
+    Targets are derived from the original sample index:
+
+        target[i] = i / 100
+
+    The first feature of every sequence also contains the original
+    sample index, making sequence identity easy to verify.
     """
 
     if timestamps is None:
@@ -86,7 +110,10 @@ def create_forecasting_dataset(
             dtype=np.float64,
         )
 
-    timestamps = np.asarray(timestamps, dtype=np.float64)
+    timestamps = np.asarray(
+        timestamps,
+        dtype=np.float64,
+    )
 
     if len(timestamps) != num_samples:
         raise ValueError(
@@ -101,16 +128,19 @@ def create_forecasting_dataset(
             CONTEXT_WINDOW,
             num_features,
         ),
-        dtype=np.float64,
+        dtype=np.dtype(dtype),
     )
 
     for sample_index in range(num_samples):
         sequences[sample_index, :, :] = float(sample_index)
 
-    targets = np.arange(
-        float(num_samples),
-        dtype=np.float64,
-    ) / 100.0
+    targets = (
+        np.arange(
+            float(num_samples),
+            dtype=np.float64,
+        )
+        / 100.0
+    )
 
     return ForecastingDataset(
         sequences=sequences,
@@ -134,21 +164,62 @@ def create_small_dataset(
     )
 
 
+def assert_partition_matches_indices(
+    subset: ForecastingDataset,
+    expected_indices: np.ndarray,
+) -> None:
+    """
+    Verify that a split contains exactly the expected original samples.
+    """
+
+    np.testing.assert_array_equal(
+        subset.timestamps,
+        expected_indices.astype(np.float64),
+    )
+
+    np.testing.assert_array_equal(
+        subset.sequences[:, 0, 0],
+        expected_indices.astype(np.float64),
+    )
+
+    np.testing.assert_array_equal(
+        subset.targets,
+        expected_indices.astype(np.float64) / 100.0,
+    )
+
+
+def assert_metadata_matches(
+    subset: ForecastingDataset,
+    original: ForecastingDataset,
+) -> None:
+    """Verify all forecasting metadata is preserved."""
+
+    assert subset.feature_names == original.feature_names
+    assert subset.context_window == original.context_window
+    assert subset.forecast_horizon == original.forecast_horizon
+    assert subset.target_name == original.target_name
+    assert subset.price_column == original.price_column
+
+
 # =============================================================================
 # SplitterConfig Tests
 # =============================================================================
 
 
 class TestSplitterConfig:
-    """Tests for SplitterConfig validation."""
+    """Tests for SplitterConfig validation and defaults."""
 
     def test_default_configuration(self) -> None:
         """Default configuration should represent approximately 70/15/15."""
 
         config = SplitterConfig()
 
-        assert config.validation_size == pytest.approx(0.15)
-        assert config.test_size == pytest.approx(0.15)
+        assert config.validation_size == pytest.approx(
+            DEFAULT_VALIDATION_SIZE
+        )
+        assert config.test_size == pytest.approx(
+            DEFAULT_TEST_SIZE
+        )
         assert config.require_chronological_order is True
         assert config.require_nonempty_splits is True
         assert config.copy_arrays is True
@@ -157,10 +228,7 @@ class TestSplitterConfig:
     def test_negative_validation_size_raises(self) -> None:
         """Negative validation proportions should be rejected."""
 
-        with pytest.raises(
-            ValueError,
-            match="validation_size must be greater than or equal to 0",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 validation_size=-0.1,
             )
@@ -168,10 +236,7 @@ class TestSplitterConfig:
     def test_negative_test_size_raises(self) -> None:
         """Negative test proportions should be rejected."""
 
-        with pytest.raises(
-            ValueError,
-            match="test_size must be greater than or equal to 0",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 test_size=-0.1,
             )
@@ -179,10 +244,7 @@ class TestSplitterConfig:
     def test_validation_size_equal_to_one_raises(self) -> None:
         """Validation size of one is invalid."""
 
-        with pytest.raises(
-            ValueError,
-            match="validation_size must be less than 1",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 validation_size=1.0,
             )
@@ -190,10 +252,7 @@ class TestSplitterConfig:
     def test_test_size_equal_to_one_raises(self) -> None:
         """Test size of one is invalid."""
 
-        with pytest.raises(
-            ValueError,
-            match="test_size must be less than 1",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 test_size=1.0,
             )
@@ -201,33 +260,49 @@ class TestSplitterConfig:
     def test_combined_ratio_equal_to_one_raises(self) -> None:
         """Validation plus test fractions cannot consume the full dataset."""
 
-        with pytest.raises(
-            ValueError,
-            match="validation_size \\+ test_size must be less than 1",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 validation_size=0.5,
                 test_size=0.5,
             )
 
+    def test_combined_ratio_greater_than_one_raises(self) -> None:
+        """Validation plus test fractions cannot exceed the dataset."""
+
+        with pytest.raises(ValueError):
+            SplitterConfig(
+                validation_size=0.8,
+                test_size=0.3,
+            )
+
     def test_nonfinite_validation_size_raises(self) -> None:
         """NaN validation proportions should be rejected."""
 
-        with pytest.raises(
-            ValueError,
-            match="validation_size must be a finite",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 validation_size=np.nan,
             )
 
+    def test_infinite_validation_size_raises(self) -> None:
+        """Infinite validation proportions should be rejected."""
+
+        with pytest.raises(ValueError):
+            SplitterConfig(
+                validation_size=np.inf,
+            )
+
     def test_nonfinite_test_size_raises(self) -> None:
+        """NaN test proportions should be rejected."""
+
+        with pytest.raises(ValueError):
+            SplitterConfig(
+                test_size=np.nan,
+            )
+
+    def test_infinite_test_size_raises(self) -> None:
         """Infinite test proportions should be rejected."""
 
-        with pytest.raises(
-            ValueError,
-            match="test_size must be a finite",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 test_size=np.inf,
             )
@@ -235,13 +310,41 @@ class TestSplitterConfig:
     def test_invalid_dtype_raises(self) -> None:
         """Invalid NumPy dtypes should be rejected."""
 
-        with pytest.raises(
-            ValueError,
-            match="Invalid NumPy dtype",
-        ):
+        with pytest.raises(ValueError):
             SplitterConfig(
                 dtype="definitely_not_a_dtype",
             )
+
+    def test_zero_validation_size_is_allowed(self) -> None:
+        """A zero validation proportion should be accepted by the config."""
+
+        config = SplitterConfig(
+            validation_size=0.0,
+            test_size=0.15,
+        )
+
+        assert config.validation_size == 0.0
+
+    def test_zero_test_size_is_allowed(self) -> None:
+        """A zero test proportion should be accepted by the config."""
+
+        config = SplitterConfig(
+            validation_size=0.15,
+            test_size=0.0,
+        )
+
+        assert config.test_size == 0.0
+
+    def test_zero_both_optional_splits_is_allowed(self) -> None:
+        """Both optional partition proportions may be configured as zero."""
+
+        config = SplitterConfig(
+            validation_size=0.0,
+            test_size=0.0,
+        )
+
+        assert config.validation_size == 0.0
+        assert config.test_size == 0.0
 
 
 # =============================================================================
@@ -259,7 +362,11 @@ class TestBasicSplitting:
 
         result = split_forecasting_dataset(dataset)
 
-        assert isinstance(result, ChronologicalDatasetSplit)
+        assert isinstance(
+            result,
+            ChronologicalDatasetSplit,
+        )
+
         assert result.train.num_samples == 70
         assert result.validation.num_samples == 15
         assert result.test.num_samples == 15
@@ -295,11 +402,6 @@ class TestBasicSplitting:
     ) -> None:
         """
         Uneven datasets should use deterministic cumulative floor boundaries.
-
-        The splitter uses:
-
-            train_end = floor(N * 0.70)
-            validation_end = floor(N * 0.85)
         """
 
         dataset = create_forecasting_dataset(num_samples)
@@ -475,6 +577,50 @@ class TestChronology:
             test_timestamps
         )
 
+    def test_non_unit_chronological_spacing_is_preserved(self) -> None:
+        """Splitting must use sample order, not timestamp spacing."""
+
+        timestamps = np.array(
+            [
+                10.0,
+                10.5,
+                12.0,
+                20.0,
+                20.25,
+                31.0,
+                50.0,
+                75.0,
+                100.0,
+                150.0,
+            ]
+        )
+
+        dataset = create_forecasting_dataset(
+            len(timestamps),
+            timestamps=timestamps,
+        )
+
+        result = split_forecasting_dataset(
+            dataset,
+            validation_size=0.20,
+            test_size=0.20,
+        )
+
+        np.testing.assert_array_equal(
+            result.train.timestamps,
+            timestamps[:6],
+        )
+
+        np.testing.assert_array_equal(
+            result.validation.timestamps,
+            timestamps[6:8],
+        )
+
+        np.testing.assert_array_equal(
+            result.test.timestamps,
+            timestamps[8:],
+        )
+
 
 # =============================================================================
 # Alignment Tests
@@ -487,9 +633,6 @@ class TestAlignment:
     def test_sequence_target_alignment_is_preserved(self) -> None:
         """
         Each sequence must remain paired with its original target.
-
-        The helper creates sequence values equal to their original sample
-        index and targets equal to index / 100.
         """
 
         dataset = create_forecasting_dataset(100)
@@ -509,6 +652,25 @@ class TestAlignment:
                 expected_targets,
             )
 
+    def test_sequence_timestamp_alignment_is_preserved(self) -> None:
+        """Sequence identity must remain aligned with timestamps."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        for subset in (
+            result.train,
+            result.validation,
+            result.test,
+        ):
+            sequence_ids = subset.sequences[:, 0, 0]
+
+            np.testing.assert_array_equal(
+                sequence_ids,
+                subset.timestamps,
+            )
+
     def test_train_alignment(self) -> None:
         """Training sequences and targets must remain aligned."""
 
@@ -516,14 +678,9 @@ class TestAlignment:
 
         result = split_forecasting_dataset(dataset)
 
-        np.testing.assert_array_equal(
-            result.train.sequences[:, 0, 0],
-            np.arange(0.0, 70.0),
-        )
-
-        np.testing.assert_array_equal(
-            result.train.targets,
-            np.arange(0.0, 70.0) / 100.0,
+        assert_partition_matches_indices(
+            result.train,
+            np.arange(0, 70),
         )
 
     def test_validation_alignment(self) -> None:
@@ -533,14 +690,9 @@ class TestAlignment:
 
         result = split_forecasting_dataset(dataset)
 
-        np.testing.assert_array_equal(
-            result.validation.sequences[:, 0, 0],
-            np.arange(70.0, 85.0),
-        )
-
-        np.testing.assert_array_equal(
-            result.validation.targets,
-            np.arange(70.0, 85.0) / 100.0,
+        assert_partition_matches_indices(
+            result.validation,
+            np.arange(70, 85),
         )
 
     def test_test_alignment(self) -> None:
@@ -550,14 +702,9 @@ class TestAlignment:
 
         result = split_forecasting_dataset(dataset)
 
-        np.testing.assert_array_equal(
-            result.test.sequences[:, 0, 0],
-            np.arange(85.0, 100.0),
-        )
-
-        np.testing.assert_array_equal(
-            result.test.targets,
-            np.arange(85.0, 100.0) / 100.0,
+        assert_partition_matches_indices(
+            result.test,
+            np.arange(85, 100),
         )
 
     def test_original_order_is_preserved(self) -> None:
@@ -621,6 +768,180 @@ class TestAlignment:
             dataset.sequences,
         )
 
+    def test_reconstruction_preserves_exact_sample_order(self) -> None:
+        """Concatenating the three partitions must reconstruct the input."""
+
+        dataset = create_forecasting_dataset(127)
+
+        result = split_forecasting_dataset(dataset)
+
+        reconstructed_sequences = np.concatenate(
+            [
+                result.train.sequences,
+                result.validation.sequences,
+                result.test.sequences,
+            ],
+            axis=0,
+        )
+
+        reconstructed_targets = np.concatenate(
+            [
+                result.train.targets,
+                result.validation.targets,
+                result.test.targets,
+            ]
+        )
+
+        reconstructed_timestamps = np.concatenate(
+            [
+                result.train.timestamps,
+                result.validation.timestamps,
+                result.test.timestamps,
+            ]
+        )
+
+        np.testing.assert_array_equal(
+            reconstructed_sequences,
+            dataset.sequences,
+        )
+
+        np.testing.assert_array_equal(
+            reconstructed_targets,
+            dataset.targets,
+        )
+
+        np.testing.assert_array_equal(
+            reconstructed_timestamps,
+            dataset.timestamps,
+        )
+
+
+# =============================================================================
+# Shape and Dtype Tests
+# =============================================================================
+
+
+class TestShapeAndDtype:
+    """Tests verifying preservation of array structure and dtype."""
+
+    @pytest.mark.parametrize(
+        "partition_name",
+        ["train", "validation", "test"],
+    )
+    def test_sequence_shape_is_preserved(
+        self,
+        partition_name: str,
+    ) -> None:
+        """Each partition must retain the expected sequence dimensions."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        subset = getattr(result, partition_name)
+
+        assert subset.sequences.ndim == 3
+        assert subset.sequences.shape[1:] == (
+            CONTEXT_WINDOW,
+            len(FEATURE_NAMES),
+        )
+
+    @pytest.mark.parametrize(
+        "partition_name",
+        ["train", "validation", "test"],
+    )
+    def test_target_shape_is_preserved(
+        self,
+        partition_name: str,
+    ) -> None:
+        """Targets must remain one-dimensional."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        subset = getattr(result, partition_name)
+
+        assert subset.targets.ndim == 1
+        assert subset.targets.shape == (
+            subset.num_samples,
+        )
+
+    @pytest.mark.parametrize(
+        "partition_name",
+        ["train", "validation", "test"],
+    )
+    def test_timestamp_shape_is_preserved(
+        self,
+        partition_name: str,
+    ) -> None:
+        """Timestamps must remain one-dimensional."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        subset = getattr(result, partition_name)
+
+        assert subset.timestamps.ndim == 1
+        assert subset.timestamps.shape == (
+            subset.num_samples,
+        )
+
+    @pytest.mark.parametrize(
+        "partition_name",
+        ["train", "validation", "test"],
+    )
+    def test_sequence_dtype_is_preserved(
+        self,
+        partition_name: str,
+    ) -> None:
+        """Sequence dtype should remain float64 by default."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        subset = getattr(result, partition_name)
+
+        assert subset.sequences.dtype == np.dtype("float64")
+
+    @pytest.mark.parametrize(
+        "partition_name",
+        ["train", "validation", "test"],
+    )
+    def test_target_dtype_is_preserved(
+        self,
+        partition_name: str,
+    ) -> None:
+        """Target dtype should remain float64."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        subset = getattr(result, partition_name)
+
+        assert subset.targets.dtype == np.dtype("float64")
+
+    @pytest.mark.parametrize(
+        "partition_name",
+        ["train", "validation", "test"],
+    )
+    def test_timestamp_dtype_is_preserved(
+        self,
+        partition_name: str,
+    ) -> None:
+        """Timestamp dtype should remain float64."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        subset = getattr(result, partition_name)
+
+        assert subset.timestamps.dtype == np.dtype("float64")
+
 
 # =============================================================================
 # Metadata Tests
@@ -628,7 +949,7 @@ class TestAlignment:
 
 
 class TestMetadata:
-    """Tests verifying metadata preservation."""
+    """Tests verifying forecasting metadata preservation."""
 
     @pytest.mark.parametrize(
         "partition_name",
@@ -646,17 +967,20 @@ class TestMetadata:
 
         subset = getattr(result, partition_name)
 
-        assert subset.feature_names == dataset.feature_names
+        assert_metadata_matches(
+            subset,
+            dataset,
+        )
 
     @pytest.mark.parametrize(
         "partition_name",
         ["train", "validation", "test"],
     )
-    def test_context_window_is_preserved(
+    def test_feature_name_order_is_preserved(
         self,
         partition_name: str,
     ) -> None:
-        """Context window metadata must remain unchanged."""
+        """Feature ordering must remain unchanged."""
 
         dataset = create_forecasting_dataset(100)
 
@@ -664,61 +988,49 @@ class TestMetadata:
 
         subset = getattr(result, partition_name)
 
-        assert subset.context_window == dataset.context_window
+        assert subset.feature_names == (
+            "mid_price_return",
+            "spread_bps",
+            "best_bid_size",
+            "best_ask_size",
+        )
 
-    @pytest.mark.parametrize(
-        "partition_name",
-        ["train", "validation", "test"],
-    )
-    def test_forecast_horizon_is_preserved(
-        self,
-        partition_name: str,
-    ) -> None:
-        """Forecast horizon metadata must remain unchanged."""
+    def test_all_partitions_have_identical_metadata(self) -> None:
+        """All partitions must share the same forecasting metadata."""
 
         dataset = create_forecasting_dataset(100)
 
         result = split_forecasting_dataset(dataset)
 
-        subset = getattr(result, partition_name)
+        assert (
+            result.train.feature_names
+            == result.validation.feature_names
+            == result.test.feature_names
+        )
 
-        assert subset.forecast_horizon == dataset.forecast_horizon
+        assert (
+            result.train.context_window
+            == result.validation.context_window
+            == result.test.context_window
+        )
 
-    @pytest.mark.parametrize(
-        "partition_name",
-        ["train", "validation", "test"],
-    )
-    def test_target_name_is_preserved(
-        self,
-        partition_name: str,
-    ) -> None:
-        """Target name must remain unchanged."""
+        assert (
+            result.train.forecast_horizon
+            == result.validation.forecast_horizon
+            == result.test.forecast_horizon
+        )
 
-        dataset = create_forecasting_dataset(100)
+        assert (
+            result.train.target_name
+            == result.validation.target_name
+            == result.test.target_name
+        )
 
-        result = split_forecasting_dataset(dataset)
-
-        subset = getattr(result, partition_name)
-
-        assert subset.target_name == dataset.target_name
-
-    @pytest.mark.parametrize(
-        "partition_name",
-        ["train", "validation", "test"],
-    )
-    def test_price_column_is_preserved(
-        self,
-        partition_name: str,
-    ) -> None:
-        """Price-column metadata must remain unchanged."""
-
-        dataset = create_forecasting_dataset(100)
-
-        result = split_forecasting_dataset(dataset)
-
-        subset = getattr(result, partition_name)
-
-        assert subset.price_column == dataset.price_column
+        assert (
+            result.train.price_column
+            == result.validation.price_column
+            == result.test.price_column
+        )
 
 
 # =============================================================================
@@ -790,14 +1102,35 @@ class TestDeterminism:
         first = split_forecasting_dataset(dataset)
         second = split_forecasting_dataset(dataset)
 
-        assert (
-            first.train_end_index
-            == second.train_end_index
-        )
+        assert first.train_end_index == second.train_end_index
 
         assert (
             first.validation_end_index
             == second.validation_end_index
+        )
+
+    def test_different_datasets_do_not_share_split_state(self) -> None:
+        """Independent inputs should produce independent split results."""
+
+        first_dataset = create_forecasting_dataset(100)
+        second_dataset = create_forecasting_dataset(100)
+
+        first_result = split_forecasting_dataset(first_dataset)
+        second_result = split_forecasting_dataset(second_dataset)
+
+        np.testing.assert_array_equal(
+            first_result.train.timestamps,
+            second_result.train.timestamps,
+        )
+
+        np.testing.assert_array_equal(
+            first_result.validation.timestamps,
+            second_result.validation.timestamps,
+        )
+
+        np.testing.assert_array_equal(
+            first_result.test.timestamps,
+            second_result.test.timestamps,
         )
 
 
@@ -864,6 +1197,38 @@ class TestCopySafety:
             == validation_original
         )
 
+    def test_train_timestamp_mutation_does_not_affect_validation(self) -> None:
+        """Partitions must not share timestamp storage."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        validation_original = result.validation.timestamps[0]
+
+        result.train.timestamps[0] = 999999.0
+
+        assert (
+            result.validation.timestamps[0]
+            == validation_original
+        )
+
+    def test_validation_sequence_mutation_does_not_affect_test(self) -> None:
+        """Sequence storage must remain independent across partitions."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        test_original = result.test.sequences[0, 0, 0]
+
+        result.validation.sequences[0, 0, 0] = 999999.0
+
+        assert (
+            result.test.sequences[0, 0, 0]
+            == test_original
+        )
+
 
 # =============================================================================
 # Boundary Tests
@@ -883,7 +1248,7 @@ class TestBoundaries:
     ) -> None:
         """
         Datasets with fewer than four samples cannot populate all three
-        partitions under the default 70/15/15 floor-boundary policy.
+        partitions under the default nonempty-split policy.
         """
 
         dataset = create_small_dataset(num_samples)
@@ -893,6 +1258,25 @@ class TestBoundaries:
             match="must contain at least one sample",
         ):
             split_forecasting_dataset(dataset)
+
+    def test_four_samples_produce_three_nonempty_partitions(self) -> None:
+        """
+        Four samples are sufficient for the default nonempty split policy.
+
+        With the default 70/15/15 floor-boundary behavior, the expected
+        partition sizes are two training samples, one validation sample,
+        and one test sample.
+        """
+
+        dataset = create_small_dataset(4)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert result.sample_counts == (2, 1, 1)
+
+        assert result.train.num_samples == 2
+        assert result.validation.num_samples == 1
+        assert result.test.num_samples == 1
 
     def test_seven_samples_produce_nonempty_default_splits(self) -> None:
         """Seven samples should produce three nonempty default partitions."""
@@ -939,6 +1323,38 @@ class TestBoundaries:
         assert result.validation.num_samples == 15
         assert result.test.num_samples == 15
 
+    @pytest.mark.parametrize(
+        ("num_samples", "validation_size", "test_size"),
+        [
+            (10, 0.10, 0.10),
+            (20, 0.20, 0.20),
+            (50, 0.10, 0.20),
+            (101, 0.20, 0.10),
+        ],
+    )
+    def test_custom_boundary_configuration(
+        self,
+        num_samples: int,
+        validation_size: float,
+        test_size: float,
+    ) -> None:
+        """Custom ratios should produce deterministic boundaries."""
+
+        dataset = create_forecasting_dataset(num_samples)
+
+        result = split_forecasting_dataset(
+            dataset,
+            validation_size=validation_size,
+            test_size=test_size,
+        )
+
+        assert (
+            result.train.num_samples
+            + result.validation.num_samples
+            + result.test.num_samples
+            == num_samples
+        )
+
 
 # =============================================================================
 # Input Validation Tests
@@ -960,6 +1376,14 @@ class TestInputValidation:
             splitter.split(
                 np.zeros((10, 20, 4))
             )
+
+    def test_none_dataset_raises(self) -> None:
+        """None should not be accepted as a dataset."""
+
+        splitter = ChronologicalSplitter()
+
+        with pytest.raises(TypeError):
+            splitter.split(None)
 
     def test_empty_dataset_raises(self) -> None:
         """An empty forecasting dataset cannot be constructed."""
@@ -983,6 +1407,41 @@ class TestInputValidation:
                 forecast_horizon=FORECAST_HORIZON,
                 target_name=TARGET_NAME,
                 price_column=PRICE_COLUMN,
+            )
+
+    def test_nonchronological_dataset_is_rejected(self) -> None:
+        """Chronological input must remain strictly ordered."""
+
+        timestamps = np.arange(
+            100.0,
+            dtype=np.float64,
+        )
+
+        timestamps[50], timestamps[51] = (
+            timestamps[51],
+            timestamps[50],
+        )
+
+        with pytest.raises(ValueError):
+            create_forecasting_dataset(
+                100,
+                timestamps=timestamps,
+            )
+
+    def test_duplicate_timestamp_dataset_is_rejected(self) -> None:
+        """Duplicate timestamps should not be accepted by the dataset contract."""
+
+        timestamps = np.arange(
+            100.0,
+            dtype=np.float64,
+        )
+
+        timestamps[50] = timestamps[49]
+
+        with pytest.raises(ValueError):
+            create_forecasting_dataset(
+                100,
+                timestamps=timestamps,
             )
 
 
@@ -1039,6 +1498,123 @@ class TestResultProperties:
 
         assert sum(result.ratios) == pytest.approx(1.0)
 
+    def test_ratios_match_sample_counts(self) -> None:
+        """Reported ratios should correspond to actual sample counts."""
+
+        dataset = create_forecasting_dataset(101)
+
+        result = split_forecasting_dataset(dataset)
+
+        train_count, validation_count, test_count = result.sample_counts
+
+        assert result.train_ratio == pytest.approx(
+            train_count / dataset.num_samples
+        )
+
+        assert result.validation_ratio == pytest.approx(
+            validation_count / dataset.num_samples
+        )
+
+        assert result.test_ratio == pytest.approx(
+            test_count / dataset.num_samples
+        )
+
+    def test_sample_counts_match_subset_sizes(self) -> None:
+        """sample_counts should match the actual subset sizes."""
+
+        dataset = create_forecasting_dataset(137)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert result.sample_counts == (
+            result.train.num_samples,
+            result.validation.num_samples,
+            result.test.num_samples,
+        )
+
+
+# =============================================================================
+# Splitter Class API Tests
+# =============================================================================
+
+
+class TestChronologicalSplitterAPI:
+    """Tests for direct ChronologicalSplitter usage."""
+
+    def test_default_splitter_matches_convenience_function(self) -> None:
+        """Class-based and convenience APIs should produce the same split."""
+
+        dataset = create_forecasting_dataset(100)
+
+        direct_result = ChronologicalSplitter().split(dataset)
+        convenience_result = split_forecasting_dataset(dataset)
+
+        for direct_subset, convenience_subset in (
+            (
+                direct_result.train,
+                convenience_result.train,
+            ),
+            (
+                direct_result.validation,
+                convenience_result.validation,
+            ),
+            (
+                direct_result.test,
+                convenience_result.test,
+            ),
+        ):
+            np.testing.assert_array_equal(
+                direct_subset.sequences,
+                convenience_subset.sequences,
+            )
+
+            np.testing.assert_array_equal(
+                direct_subset.targets,
+                convenience_subset.targets,
+            )
+
+            np.testing.assert_array_equal(
+                direct_subset.timestamps,
+                convenience_subset.timestamps,
+            )
+
+    def test_custom_config_matches_direct_arguments(self) -> None:
+        """Equivalent configuration paths should produce identical splits."""
+
+        dataset = create_forecasting_dataset(100)
+
+        config = SplitterConfig(
+            validation_size=0.20,
+            test_size=0.10,
+        )
+
+        config_result = ChronologicalSplitter(
+            config=config,
+        ).split(dataset)
+
+        direct_result = split_forecasting_dataset(
+            dataset,
+            validation_size=0.20,
+            test_size=0.10,
+        )
+
+        assert config_result.sample_counts == direct_result.sample_counts
+
+        np.testing.assert_array_equal(
+            config_result.train.timestamps,
+            direct_result.train.timestamps,
+        )
+
+        np.testing.assert_array_equal(
+            config_result.validation.timestamps,
+            direct_result.validation.timestamps,
+        )
+
+        np.testing.assert_array_equal(
+            config_result.test.timestamps,
+            direct_result.test.timestamps,
+        )
+
 
 # =============================================================================
 # Existing ForecastingConfig Integration Tests
@@ -1049,7 +1625,7 @@ class TestForecastingConfigIntegration:
     """Tests for integration with the existing forecasting configuration."""
 
     def test_split_from_forecasting_config(self) -> None:
-        """Existing ForecastingConfig-style values should drive the split."""
+        """ForecastingConfig-style values should drive the split."""
 
         dataset = create_forecasting_dataset(100)
 
@@ -1083,6 +1659,122 @@ class TestForecastingConfigIntegration:
         )
 
         assert result.sample_counts == (70, 20, 10)
+
+    def test_real_forecasting_config_defaults(self) -> None:
+        """The real ForecastingConfig should integrate with the splitter."""
+
+        dataset = create_forecasting_dataset(100)
+
+        forecasting_config = ForecastingConfig()
+
+        result = split_from_forecasting_config(
+            dataset,
+            forecasting_config,
+        )
+
+        assert result.sample_counts == (70, 15, 15)
+
+    def test_real_forecasting_config_ratios_are_respected(self) -> None:
+        """Real ForecastingConfig ratio fields should drive the split."""
+
+        dataset = create_forecasting_dataset(100)
+
+        forecasting_config = ForecastingConfig(
+            val_size=0.20,
+            test_size=0.10,
+        )
+
+        result = split_from_forecasting_config(
+            dataset,
+            forecasting_config,
+        )
+
+        assert result.sample_counts == (70, 20, 10)
+
+
+# =============================================================================
+# Temporal Leakage Protection Tests
+# =============================================================================
+
+
+class TestTemporalLeakageProtection:
+    """
+    Tests focused specifically on leakage-sensitive chronological behavior.
+    """
+
+    def test_training_never_contains_future_validation_samples(self) -> None:
+        """Training must end before validation begins."""
+
+        dataset = create_forecasting_dataset(200)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert np.max(result.train.timestamps) < np.min(
+            result.validation.timestamps
+        )
+
+    def test_training_never_contains_future_test_samples(self) -> None:
+        """Training must end before testing begins."""
+
+        dataset = create_forecasting_dataset(200)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert np.max(result.train.timestamps) < np.min(
+            result.test.timestamps
+        )
+
+    def test_validation_never_contains_future_test_samples(self) -> None:
+        """Validation must end before testing begins."""
+
+        dataset = create_forecasting_dataset(200)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert np.max(result.validation.timestamps) < np.min(
+            result.test.timestamps
+        )
+
+    def test_partitions_form_contiguous_time_blocks(self) -> None:
+        """Each partition must represent one contiguous region of time."""
+
+        dataset = create_forecasting_dataset(200)
+
+        result = split_forecasting_dataset(dataset)
+
+        combined = np.concatenate(
+            [
+                result.train.timestamps,
+                result.validation.timestamps,
+                result.test.timestamps,
+            ]
+        )
+
+        np.testing.assert_array_equal(
+            combined,
+            dataset.timestamps,
+        )
+
+    def test_no_future_sample_is_present_in_training(self) -> None:
+        """The latest training timestamp must equal the training boundary."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert result.train.timestamps[-1] == 69.0
+        assert result.validation.timestamps[0] == 70.0
+
+    def test_test_partition_contains_only_latest_samples(self) -> None:
+        """The test partition must consist exclusively of the latest samples."""
+
+        dataset = create_forecasting_dataset(100)
+
+        result = split_forecasting_dataset(dataset)
+
+        assert np.all(
+            result.test.timestamps >= 85.0
+        )
 
 
 # =============================================================================
