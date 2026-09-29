@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
 
+from config.config import DEFAULT_CONFIG
 from data.contracts import (
     MarketSnapshot,
     OrderSide,
@@ -16,6 +17,7 @@ from data.contracts import (
     ExecutionResult,
     ExecutionDecision,
     PredictionResult,
+    ExecutionContext,
 )
 from features import extract_snapshot_features_dict
 from execution.order_manager import OrderManager
@@ -68,7 +70,7 @@ class ExecutionSimulator:
         trajectory: List[Dict[str, Any]] = []
 
         last_decision_time = -1.0
-        decision_interval_sec = 2.0  # Strategy evaluates every 2 seconds or on fill
+        decision_interval_sec = DEFAULT_CONFIG.execution.decision_interval_sec  # Strategy evaluates every N seconds or on fill
 
         for tick_idx, snap in enumerate(snapshots):
             elapsed_time = snap.timestamp - start_time
@@ -140,21 +142,47 @@ class ExecutionSimulator:
                 )
                 last_decision_time = snap.timestamp
 
-                # Record trajectory point
-                trajectory.append({
-                    "timestamp": snap.timestamp,
-                    "elapsed_time": round(elapsed_time, 2),
-                    "remaining_quantity": round(remaining_qty, 2),
-                    "filled_quantity": round(order_manager.total_filled_quantity, 2),
-                    "mid_price": snap.mid_price,
-                    "decision_strategy": decision.strategy,
-                    "decision_quantity": decision.quantity,
-                    "execution_mode": decision.execution_mode.value,
-                    "cancel_active_orders": decision.cancel_active_orders,
-                    "urgency": decision.urgency,
-                    "risk_score": decision.risk_score,
-                    "reason": decision.reason,
-                })
+                # Record trajectory point — include execution context fields
+                ctx = decision.__dict__.get("execution_context")
+                if ctx is not None and hasattr(ctx, 'has_valid_forecast'):
+                    trajectory.append({
+                        "timestamp": snap.timestamp,
+                        "elapsed_time": round(elapsed_time, 2),
+                        "remaining_quantity": round(remaining_qty, 2),
+                        "filled_quantity": round(order_manager.total_filled_quantity, 2),
+                        "mid_price": snap.mid_price,
+                        "decision_strategy": decision.strategy,
+                        "decision_quantity": decision.quantity,
+                        "execution_mode": decision.execution_mode.value,
+                        "cancel_active_orders": decision.cancel_active_orders,
+                        "urgency": decision.urgency,
+                        "risk_score": decision.risk_score,
+                        "reason": decision.reason,
+                        "adverse_risk_probability": ctx.adverse_risk.probability,
+                        "adverse_risk_model_status": ctx.adverse_risk.model_status,
+                        "ac_slice_quantity": ctx.ac_slice_quantity,
+                        "ac_expected_cost": ctx.ac_expected_cost,
+                        "urgency": ctx.urgency,
+                        "forecast_predicted_return": ctx.forecast.predicted_return if ctx.forecast else None,
+                        "forecast_model_status": ctx.forecast.model_status if ctx.forecast else None,
+                        "has_valid_forecast": ctx.has_valid_forecast,
+                        "is_ml_fallback": ctx.is_ml_fallback,
+                    })
+                else:
+                    trajectory.append({
+                        "timestamp": snap.timestamp,
+                        "elapsed_time": round(elapsed_time, 2),
+                        "remaining_quantity": round(remaining_qty, 2),
+                        "filled_quantity": round(order_manager.total_filled_quantity, 2),
+                        "mid_price": snap.mid_price,
+                        "decision_strategy": decision.strategy,
+                        "decision_quantity": decision.quantity,
+                        "execution_mode": decision.execution_mode.value,
+                        "cancel_active_orders": decision.cancel_active_orders,
+                        "urgency": decision.urgency,
+                        "risk_score": decision.risk_score,
+                        "reason": decision.reason,
+                    })
 
                 remaining_qty, snap = self.apply_execution_decision(
                     decision=decision,

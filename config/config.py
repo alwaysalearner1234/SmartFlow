@@ -12,7 +12,7 @@ market movement.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 
 
@@ -236,6 +236,29 @@ class ExecutionConfig:
     passive_price_offset_ticks: int = 0
     max_participation_rate: float = 0.20
 
+    decision_interval_sec: float = 2.0
+    ac_num_slices: int = 12
+
+
+# ============================================================================
+# Forecast Configuration
+# ============================================================================
+
+@dataclass(frozen=True)
+class ForecastConfig:
+    """
+    Configuration for the NVIDIA short-term market forecasting pipeline.
+
+    Controls whether the forecaster is enabled, the endpoint connection details,
+    staleness guard, and the forecast horizon used when building execution context.
+    """
+
+    enabled: bool = False
+    endpoint_url: Optional[str] = None
+    timeout_sec: float = 2.0
+    max_staleness_sec: float = 5.0
+    forecast_horizon: int = 5
+
 
 # ============================================================================
 # Simulation Configuration
@@ -285,6 +308,10 @@ class SystemConfig:
 
     simulation: SimulationConfig = field(
         default_factory=SimulationConfig
+    )
+
+    forecast: ForecastConfig = field(
+        default_factory=ForecastConfig
     )
 
 

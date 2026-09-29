@@ -15,7 +15,8 @@ Separates three independent signals:
    Answers: "How much inventory should we execute this cycle?"
    Controls sizing/trajectory, not short-term market direction.
 
-A directional price forecast is intentionally out of scope for this layer.
+NVIDIA forecast is carried in ExecutionContext; it influences decisions
+from Phase 7. This layer does not branch on the forecast in Phase 1–5.
 """
 
 from typing import Any, Optional
@@ -25,6 +26,7 @@ from data.contracts import (
     ExecutionMode,
     OrderSide,
     PredictionResult,
+    ExecutionContext,
 )
 from strategies.base import BaseExecutionStrategy
 from execution.almgren_chriss import AlmgrenChrissModel
@@ -88,19 +90,32 @@ class ProposedStrategy(BaseExecutionStrategy):
             pred_res = self.predictor.predict(features, side=side, timestamp=snapshot.timestamp)
         risk_score = pred_res.probability
 
-        time_rem = max(1.0, total_horizon - elapsed_time)
-        sched = self.ac_model.generate_schedule(
-            total_quantity=remaining_quantity,
-            horizon_sec=time_rem,
-            num_slices=max(2, int(time_rem / 5.0)),
-            initial_price=snapshot.mid_price,
-        )
-        ac_slice = sched.trade_sizes[0] if len(sched.trade_sizes) > 0 else remaining_quantity
-        expected_cost = sched.expected_cost
+        # Read execution context if available (Phase 5+)
+        ec: Optional[ExecutionContext] = kwargs.get("execution_context")
+        if ec is not None:
+            ac_slice_quantity = ec.ac_slice_quantity
+            ac_expected_cost = ec.ac_expected_cost
+            # Mention forecast status in reason but do not branch on it yet
+            forecast_status = ec.forecast.model_status if ec.forecast else "none"
+        else:
+            # Original: generate AC schedule inline
+            time_rem = max(1.0, total_horizon - elapsed_time)
+            sched = self.ac_model.generate_schedule(
+                total_quantity=remaining_quantity,
+                horizon_sec=time_rem,
+                num_slices=max(2, int(time_rem / 5.0)),
+                initial_price=snapshot.mid_price,
+            )
+            ac_slice_quantity = float(sched.trade_sizes[0]) if len(sched.trade_sizes) > 0 else remaining_quantity
+            ac_expected_cost = float(sched.expected_cost)
+
+        # NOTE: forecast is carried in ExecutionContext but does not influence
+        # decisions until Phase 7. The forecast status is recorded in the reason
+        # text for observability but does not change control flow.
 
         # CASE B — completion urgency dominates, including when passive risk is high.
         if urgency >= self.urgency_high_thresh:
-            slice_size = min(remaining_quantity, max(ac_slice * 1.5, remaining_quantity * 0.4))
+            slice_size = min(remaining_quantity, max(ac_slice_quantity * 1.5, remaining_quantity * 0.4))
             limit_p = snapshot.best_ask if side == OrderSide.BUY else snapshot.best_bid
             reason = (
                 f"Passive adverse-selection risk is {risk_score:.2f}. "
@@ -108,7 +123,7 @@ class ProposedStrategy(BaseExecutionStrategy):
                 f"Passive exposure is no longer appropriate because execution completion now dominates "
                 f"spread-capture considerations. Resulting mode: AGGRESSIVE. "
                 f"Executing an aggressive Almgren-Chriss-guided slice of {slice_size:.1f} units "
-                f"to reduce completion shortfall (AC expected cost ${expected_cost:.2f})."
+                f"to reduce completion shortfall (AC expected cost ${ac_expected_cost:.2f})."
             )
             return self._build_decision(
                 snapshot=snapshot,
@@ -118,7 +133,7 @@ class ProposedStrategy(BaseExecutionStrategy):
                 urgency=urgency,
                 risk_score=risk_score,
                 remaining_quantity=remaining_quantity,
-                expected_cost=expected_cost,
+                expected_cost=ac_expected_cost,
                 execution_mode=ExecutionMode.AGGRESSIVE,
                 cancel_active_orders=True,
                 reason=reason,
@@ -132,7 +147,7 @@ class ProposedStrategy(BaseExecutionStrategy):
                 f"Completion urgency is {urgency:.2f}, below the {self.urgency_high_thresh:.2f} aggressive threshold. "
                 f"Resulting mode: HOLD. Resting maker exposure is withdrawn and no new order is "
                 f"submitted this cycle because passive fills are currently unsafe. "
-                f"Almgren-Chriss still schedules a slice of {ac_slice:.1f} units, but that inventory "
+                f"Almgren-Chriss still schedules a slice of {ac_slice_quantity:.1f} units, but that inventory "
                 f"is deferred until either toxicity falls or completion pressure rises."
             )
             return self._build_decision(
@@ -143,7 +158,7 @@ class ProposedStrategy(BaseExecutionStrategy):
                 urgency=urgency,
                 risk_score=risk_score,
                 remaining_quantity=remaining_quantity,
-                expected_cost=expected_cost,
+                expected_cost=ac_expected_cost,
                 execution_mode=ExecutionMode.HOLD,
                 cancel_active_orders=True,
                 reason=reason,
@@ -160,7 +175,7 @@ class ProposedStrategy(BaseExecutionStrategy):
                 f"Completion urgency is {urgency:.2f}, below the {self.urgency_high_thresh:.2f} aggressive threshold. "
                 f"Resulting mode: PASSIVE. SmartFlow is exposing a maker order of {slice_size:.1f} units "
                 f"at the same-side best quote ({limit_p:.4f}) to capture spread while maintaining "
-                f"execution progress (Almgren-Chriss reference slice {ac_slice:.1f} units)."
+                f"execution progress (Almgren-Chriss reference slice {ac_slice_quantity:.1f} units)."
             )
             return self._build_decision(
                 snapshot=snapshot,
@@ -170,21 +185,21 @@ class ProposedStrategy(BaseExecutionStrategy):
                 urgency=urgency,
                 risk_score=risk_score,
                 remaining_quantity=remaining_quantity,
-                expected_cost=expected_cost,
+                expected_cost=ac_expected_cost,
                 execution_mode=ExecutionMode.PASSIVE,
                 cancel_active_orders=False,
                 reason=reason,
             )
 
         # CASE E — moderate toxicity: follow the AC inventory trajectory with a taker slice.
-        slice_size = min(remaining_quantity, ac_slice)
+        slice_size = min(remaining_quantity, ac_slice_quantity)
         limit_p = snapshot.best_ask if side == OrderSide.BUY else snapshot.best_bid
         reason = (
             f"Passive toxicity risk is moderate at {risk_score:.2f}, between the "
             f"{self.risk_low_thresh:.2f} and {self.risk_high_thresh:.2f} thresholds. "
             f"Completion urgency is {urgency:.2f}, below the {self.urgency_high_thresh:.2f} aggressive threshold. "
             f"Resulting mode: AGGRESSIVE. SmartFlow is following the Almgren-Chriss inventory trajectory "
-            f"with a scheduled taker slice of {slice_size:.1f} units (expected cost ${expected_cost:.2f}). "
+            f"with a scheduled taker slice of {slice_size:.1f} units (expected cost ${ac_expected_cost:.2f}). "
             f"This is execution-progress sizing, not a directional price forecast."
         )
         return self._build_decision(
@@ -195,7 +210,7 @@ class ProposedStrategy(BaseExecutionStrategy):
             urgency=urgency,
             risk_score=risk_score,
             remaining_quantity=remaining_quantity,
-            expected_cost=expected_cost,
+            expected_cost=ac_expected_cost,
             execution_mode=ExecutionMode.AGGRESSIVE,
             cancel_active_orders=True,
             reason=reason,
