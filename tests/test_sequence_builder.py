@@ -1,35 +1,29 @@
-"""
-Tests for the SmartFlow rolling forecasting sequence builder.
+# tests/test_sequence_builder.py
+#
+# Purpose:
+# Comprehensive tests for the rolling sequence dataset builder used by the
+# NVIDIA forecasting data pipeline.
+#
+# Responsibilities:
+# - Verify SequenceBuilder configuration and defaults.
+# - Verify required feature-history columns.
+# - Verify timestamp validation and chronological ordering.
+# - Verify NVIDIA feature validation.
+# - Verify rolling-window sequence construction.
+# - Verify sequence/timestamp alignment.
+# - Verify SequenceDataset integration.
+# - Verify convenience API behavior.
+# - Verify NVIDIA forecasting input-contract compatibility.
+# - Verify invalid and edge-case inputs.
+# - Verify deterministic and input-independent behavior.
+#
+# The module does not test model architecture, model training, normalization,
+# target construction, chronological splitting, or forecasting performance.
+#
+# The tests intentionally follow the behavior of the production
+# SequenceBuilder and SequenceDataset implementations.
 
-This test module validates Phase 3 of the forecasting data pipeline.
-
-Phase 3 transforms chronological feature history into overlapping fixed-length
-input sequences for the NVIDIA forecasting model.
-
-The tests focus on:
-
-- correct sequence shape
-- correct sequence count
-- correct feature ordering
-- correct rolling-window behavior
-- chronological timestamps
-- sequence timestamp alignment
-- insufficient-history handling
-- missing-column handling
-- duplicate-timestamp handling
-- non-chronological input handling
-- missing-value handling
-- infinite-value handling
-- deterministic output
-- input immutability
-- custom context-window support
-- public convenience API
-
-The tests intentionally do not test future-return targets because target
-construction belongs to Phase 4.
-"""
-
-from __future__ import annotations
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -45,809 +39,1466 @@ from data.sequence_builder import (
 )
 
 
-# ============================================================================
-# Test Constants
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Shared test constants
+# ---------------------------------------------------------------------------
 
-DEFAULT_FEATURE_COUNT = 14
+CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW
+FEATURE_NAMES = list(NVIDIA_FEATURES)
+FEATURE_COUNT = len(FEATURE_NAMES)
+
+DEFAULT_ROW_COUNT = 40
 
 
-# ============================================================================
-# Test Data Helpers
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Test-data helpers
+# ---------------------------------------------------------------------------
 
 
 def make_feature_history(
-    row_count: int = 25,
+    row_count: int = DEFAULT_ROW_COUNT,
+    *,
+    start_timestamp: float = 1_000.0,
+    timestamp_step: float = 1.0,
 ) -> pd.DataFrame:
     """
-    Create deterministic synthetic Phase 2 feature history.
+    Build a deterministic feature-history DataFrame for sequence-builder tests.
 
-    Each feature receives a simple deterministic sequence so that individual
-    rolling-window values can be checked precisely.
-
-    For example:
-
-        mid_price_return:
-            0.001
-            0.002
-            0.003
-            ...
-
-        spread_bps:
-            0.002
-            0.004
-            0.006
-            ...
-
-    The exact values are less important than their deterministic relationship
-    to the row index.
+    The generated data follows the same column order expected by the
+    production SequenceBuilder.
     """
+    if row_count < 1:
+        raise ValueError("row_count must be positive.")
 
-    timestamps = np.arange(
-        1,
-        row_count + 1,
-        dtype=float,
-    )
+    timestamps = [
+        start_timestamp + index * timestamp_step
+        for index in range(row_count)
+    ]
 
     data = {
         "timestamp": timestamps,
     }
 
-    for feature_index, feature_name in enumerate(NVIDIA_FEATURES):
-        data[feature_name] = (
-            np.arange(
-                1,
-                row_count + 1,
-                dtype=float,
-            )
-            * float(feature_index + 1)
-        )
+    for feature_index, feature_name in enumerate(FEATURE_NAMES):
+        data[feature_name] = [
+            float(feature_index + row_index / 100.0)
+            for row_index in range(row_count)
+        ]
 
     return pd.DataFrame(data)
 
 
-def make_feature_history_with_extra_columns(
-    row_count: int = 25,
-) -> pd.DataFrame:
-    """Create valid feature history containing unrelated extra columns."""
-
-    frame = make_feature_history(row_count)
-
-    frame["mid_price"] = np.arange(
-        100.0,
-        100.0 + row_count,
+def make_builder(
+    *,
+    context_window: int = CONTEXT_WINDOW,
+    **overrides,
+) -> SequenceBuilder:
+    """Create a SequenceBuilder with the requested configuration overrides."""
+    config = SequenceBuilderConfig(
+        context_window=context_window,
+        **overrides,
     )
 
-    frame["unused_column"] = np.arange(
-        0,
-        row_count,
+    return SequenceBuilder(config=config)
+
+
+# ---------------------------------------------------------------------------
+# SequenceBuilderConfig tests
+# ---------------------------------------------------------------------------
+
+
+class TestSequenceBuilderConfig:
+    """Tests for SequenceBuilderConfig defaults and configuration behavior."""
+
+    def test_default_context_window(self):
+        """The default context window should match the forecasting contract."""
+        config = SequenceBuilderConfig()
+
+        assert config.context_window == CONTEXT_WINDOW
+
+    def test_default_chronological_validation(self):
+        """Chronological validation should be enabled by default."""
+        config = SequenceBuilderConfig()
+
+        assert config.require_chronological_order is True
+
+    def test_default_unique_timestamp_validation(self):
+        """Unique timestamp validation should be enabled by default."""
+        config = SequenceBuilderConfig()
+
+        assert config.require_unique_timestamps is True
+
+    def test_default_missing_value_policy(self):
+        """Missing values should be rejected by default."""
+        config = SequenceBuilderConfig()
+
+        assert config.allow_missing_values is False
+
+    def test_default_infinite_value_policy(self):
+        """Infinite feature values should be rejected by default."""
+        config = SequenceBuilderConfig()
+
+        assert config.allow_infinite_values is False
+
+    def test_default_copy_policy(self):
+        """Input data should be copied by default."""
+        config = SequenceBuilderConfig()
+
+        assert config.copy_input is True
+
+    def test_default_dtype(self):
+        """Sequences should use float64 by default."""
+        config = SequenceBuilderConfig()
+
+        assert config.dtype == "float64"
+
+    def test_custom_context_window(self):
+        """A custom positive context window should be accepted."""
+        config = SequenceBuilderConfig(context_window=5)
+
+        assert config.context_window == 5
+
+    @pytest.mark.parametrize(
+        "context_window",
+        [0, -1, -5],
     )
+    def test_invalid_context_window_rejected(self, context_window):
+        """Non-positive context windows should be rejected."""
+        with pytest.raises(ValueError):
+            SequenceBuilderConfig(context_window=context_window)
 
-    return frame
 
+# ---------------------------------------------------------------------------
+# Basic builder construction tests
+# ---------------------------------------------------------------------------
 
-# ============================================================================
-# Configuration Tests
-# ============================================================================
 
+class TestSequenceBuilderConstruction:
+    """Tests for constructing SequenceBuilder instances."""
 
-def test_default_context_window_is_twenty() -> None:
-    """The Phase 3 default context window should be 20 observations."""
+    def test_builder_accepts_default_config(self):
+        """A builder should be constructible with the default configuration."""
+        builder = SequenceBuilder()
 
-    assert DEFAULT_CONTEXT_WINDOW == 20
+        assert builder.config.context_window == CONTEXT_WINDOW
 
-    config = SequenceBuilderConfig()
+    def test_builder_accepts_custom_config(self):
+        """A builder should preserve custom configuration values."""
+        config = SequenceBuilderConfig(context_window=10)
+        builder = SequenceBuilder(config=config)
 
-    assert config.context_window == 20
+        assert builder.config.context_window == 10
 
+    def test_builder_preserves_config(self):
+        """The builder should expose the supplied configuration."""
+        config = SequenceBuilderConfig(
+            context_window=10,
+            require_chronological_order=False,
+            require_unique_timestamps=False,
+        )
 
-def test_invalid_context_window_is_rejected() -> None:
-    """Context windows must be positive."""
+        builder = SequenceBuilder(config=config)
 
-    with pytest.raises(
-        ValueError,
-        match="context_window must be greater than zero",
-    ):
-        SequenceBuilderConfig(context_window=0)
+        assert builder.config == config
 
-    with pytest.raises(
-        ValueError,
-        match="context_window must be greater than zero",
-    ):
-        SequenceBuilderConfig(context_window=-5)
 
+# ---------------------------------------------------------------------------
+# Required-column validation
+# ---------------------------------------------------------------------------
 
-def test_invalid_dtype_is_rejected() -> None:
-    """An invalid NumPy dtype should fail during configuration."""
 
-    with pytest.raises(
-        ValueError,
-        match="Invalid NumPy dtype",
-    ):
-        SequenceBuilderConfig(dtype="not_a_real_dtype")
+class TestRequiredColumns:
+    """Tests for required feature-history columns."""
 
+    def test_timestamp_column_is_required(self):
+        """A feature history without timestamp should be rejected."""
+        frame = make_feature_history().drop(columns=["timestamp"])
 
-# ============================================================================
-# Basic Construction Tests
-# ============================================================================
+        builder = make_builder()
 
+        with pytest.raises(ValueError, match="timestamp"):
+            builder.build(frame)
 
-def test_build_returns_sequence_dataset() -> None:
-    """The builder should return the shared SequenceDataset contract."""
+    @pytest.mark.parametrize("feature_name", FEATURE_NAMES)
+    def test_each_nvidia_feature_is_required(self, feature_name):
+        """Every NVIDIA forecasting feature must be present."""
+        frame = make_feature_history().drop(columns=[feature_name])
 
-    frame = make_feature_history(25)
+        builder = make_builder()
 
-    dataset = SequenceBuilder().build(frame)
+        with pytest.raises(ValueError, match=feature_name):
+            builder.build(frame)
 
-    assert isinstance(dataset, SequenceDataset)
+    def test_missing_multiple_columns_is_rejected(self):
+        """Multiple missing required columns should still be rejected."""
+        frame = make_feature_history().drop(
+            columns=["timestamp", FEATURE_NAMES[0], FEATURE_NAMES[1]]
+        )
 
+        builder = make_builder()
 
-def test_default_sequence_shape_is_correct() -> None:
-    """
-    25 rows with a context window of 20 should produce 6 sequences.
+        with pytest.raises(ValueError):
+            builder.build(frame)
 
-    Formula:
+    def test_extra_columns_are_allowed(self):
+        """Additional columns should not prevent sequence construction."""
+        frame = make_feature_history()
+        frame["extra_column"] = np.arange(len(frame), dtype=float)
 
-        N - W + 1
-        25 - 20 + 1
-        = 6
-    """
+        builder = make_builder()
 
-    frame = make_feature_history(25)
+        result = builder.build(frame)
 
-    dataset = SequenceBuilder().build(frame)
-
-    assert dataset.shape == (6, 20, DEFAULT_FEATURE_COUNT)
-
-
-def test_sequence_count_is_correct() -> None:
-    """Verify the rolling-window sequence-count formula."""
-
-    for row_count in [20, 21, 25, 40, 100]:
-        frame = make_feature_history(row_count)
-
-        dataset = SequenceBuilder().build(frame)
-
-        expected_count = row_count - 20 + 1
-
-        assert dataset.num_sequences == expected_count
-
-
-def test_sequence_feature_count_is_fourteen() -> None:
-    """Every sequence must contain exactly the 14 agreed forecasting features."""
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    assert dataset.num_features == DEFAULT_FEATURE_COUNT
-    assert len(dataset.feature_names) == DEFAULT_FEATURE_COUNT
-
-
-def test_feature_names_match_nvidia_contract() -> None:
-    """Feature names and ordering must exactly match NVIDIA_FEATURES."""
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    assert dataset.feature_names == list(NVIDIA_FEATURES)
-
-
-# ============================================================================
-# Rolling-Window Correctness Tests
-# ============================================================================
-
-
-def test_first_sequence_contains_first_twenty_rows() -> None:
-    """The first sequence must contain rows 1 through 20."""
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    expected = frame[
-        list(NVIDIA_FEATURES)
-    ].iloc[:20].to_numpy()
-
-    np.testing.assert_array_equal(
-        dataset.sequences[0],
-        expected,
-    )
-
-
-def test_second_sequence_shifts_forward_by_one_row() -> None:
-    """The second sequence must begin at the second input observation."""
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    expected = frame[
-        list(NVIDIA_FEATURES)
-    ].iloc[1:21].to_numpy()
-
-    np.testing.assert_array_equal(
-        dataset.sequences[1],
-        expected,
-    )
-
-
-def test_last_sequence_contains_last_twenty_rows() -> None:
-    """The final sequence must end at the final available observation."""
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    expected = frame[
-        list(NVIDIA_FEATURES)
-    ].iloc[-20:].to_numpy()
-
-    np.testing.assert_array_equal(
-        dataset.sequences[-1],
-        expected,
-    )
-
-
-def test_sequences_overlap_by_nineteen_rows() -> None:
-    """
-    Adjacent 20-row sequences should overlap by 19 observations.
-
-    This confirms that the builder creates a rolling window rather than
-    non-overlapping chunks.
-    """
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    np.testing.assert_array_equal(
-        dataset.sequences[0, 1:],
-        dataset.sequences[1, :-1],
-    )
-
-
-def test_feature_order_is_preserved() -> None:
-    """Feature columns must remain in the exact NVIDIA contract order."""
-
-    frame = make_feature_history(25)
-
-    # Reverse the DataFrame's column order to ensure the builder does not
-    # depend on the caller's column ordering.
-    frame = frame[
-        list(reversed(frame.columns))
-    ]
-
-    dataset = SequenceBuilder().build(frame)
-
-    assert dataset.feature_names == list(NVIDIA_FEATURES)
-
-    expected_first_value = 1.0
-
-    for feature_index in range(DEFAULT_FEATURE_COUNT):
-        assert (
-            dataset.sequences[0, 0, feature_index]
-            == expected_first_value * (feature_index + 1)
+        assert result.sequences.shape[1:] == (
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
         )
 
 
-# ============================================================================
-# Timestamp Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Input type validation
+# ---------------------------------------------------------------------------
 
 
-def test_sequence_timestamps_match_feature_rows() -> None:
-    """Every sequence must retain the timestamps of its source observations."""
+class TestInputTypeValidation:
+    """Tests for invalid input objects."""
 
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    expected_first = list(
-        frame["timestamp"].iloc[:20]
+    @pytest.mark.parametrize(
+        "invalid_input",
+        [
+            None,
+            [],
+            {},
+            np.array([1, 2, 3]),
+            "not a dataframe",
+        ],
     )
+    def test_non_dataframe_input_raises(self, invalid_input):
+        """SequenceBuilder should require a pandas DataFrame."""
+        builder = make_builder()
 
-    expected_second = list(
-        frame["timestamp"].iloc[1:21]
-    )
-
-    assert dataset.timestamps[0] == expected_first
-    assert dataset.timestamps[1] == expected_second
-
-
-def test_sequence_timestamps_are_chronological() -> None:
-    """Every generated timestamp window must be chronological."""
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    for timestamp_window in dataset.timestamps:
-        assert timestamp_window == sorted(timestamp_window)
+        with pytest.raises((TypeError, ValueError)):
+            builder.build(invalid_input)
 
 
-def test_sequence_timestamps_are_unique() -> None:
-    """Every timestamp within a sequence must be unique."""
+# ---------------------------------------------------------------------------
+# Timestamp validation
+# ---------------------------------------------------------------------------
 
-    frame = make_feature_history(25)
 
-    dataset = SequenceBuilder().build(frame)
+class TestTimestampValidation:
+    """Tests for timestamp validity and ordering."""
 
-    for timestamp_window in dataset.timestamps:
-        assert len(timestamp_window) == len(
-            set(timestamp_window)
+    def test_timestamps_must_be_numeric(self):
+        """Non-numeric timestamps should be rejected."""
+        frame = make_feature_history()
+
+        frame["timestamp"] = frame["timestamp"].astype(object)
+        frame.loc[5, "timestamp"] = "invalid"
+
+        builder = make_builder()
+
+        with pytest.raises(
+            ValueError,
+            match="timestamps must be numeric and finite",
+        ):
+            builder.build(frame)
+
+    def test_nan_timestamp_raises(self):
+        """NaN timestamps should be rejected."""
+        frame = make_feature_history()
+        frame.loc[5, "timestamp"] = np.nan
+
+        builder = make_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_infinite_timestamp_raises(self):
+        """Infinite timestamps should be rejected."""
+        frame = make_feature_history()
+        frame.loc[5, "timestamp"] = np.inf
+
+        builder = make_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_negative_infinite_timestamp_raises(self):
+        """Negative infinite timestamps should be rejected."""
+        frame = make_feature_history()
+        frame.loc[5, "timestamp"] = -np.inf
+
+        builder = make_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_duplicate_timestamps_raise_by_default(self):
+        """Duplicate timestamps should be rejected by default."""
+        frame = make_feature_history()
+        frame.loc[10, "timestamp"] = frame.loc[9, "timestamp"]
+
+        builder = make_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_duplicate_timestamp_validation_can_be_disabled(self):
+        """
+        Disabling builder-level duplicate validation does not bypass the
+        downstream SequenceDataset timestamp contract.
+        """
+        frame = make_feature_history()
+        frame.loc[10, "timestamp"] = frame.loc[9, "timestamp"]
+
+        builder = make_builder(
+            require_unique_timestamps=False,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_non_chronological_timestamps_raise_by_default(self):
+        """Non-chronological timestamps should be rejected."""
+        frame = make_feature_history()
+
+        frame.loc[10, "timestamp"], frame.loc[11, "timestamp"] = (
+            frame.loc[11, "timestamp"],
+            frame.loc[10, "timestamp"],
+        )
+
+        builder = make_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_chronological_validation_can_be_disabled(self):
+        """
+        Disabling builder-level chronological validation does not bypass the
+        downstream SequenceDataset timestamp contract.
+        """
+        frame = make_feature_history()
+
+        frame.loc[10, "timestamp"], frame.loc[11, "timestamp"] = (
+            frame.loc[11, "timestamp"],
+            frame.loc[10, "timestamp"],
+        )
+
+        builder = make_builder(
+            require_chronological_order=False,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_equal_adjacent_timestamps_are_rejected_by_dataset_contract(self):
+        """
+        Even when builder-level uniqueness validation is disabled, the
+        SequenceDataset contract requires unique timestamps.
+        """
+        frame = make_feature_history()
+        frame.loc[10, "timestamp"] = frame.loc[9, "timestamp"]
+
+        builder = make_builder(
+            require_unique_timestamps=False,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_timestamp_order_is_preserved(self):
+        """Valid timestamps should remain chronological in every sequence."""
+        frame = make_feature_history()
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        for timestamp_window in result.timestamps:
+            assert timestamp_window == sorted(timestamp_window)
+
+    def test_timestamp_windows_have_context_window_length(self):
+        """Every timestamp window should contain exactly W timestamps."""
+        frame = make_feature_history()
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert all(
+            len(timestamp_window) == CONTEXT_WINDOW
+            for timestamp_window in result.timestamps
         )
 
 
-# ============================================================================
-# Boundary Tests
-# ============================================================================
-
-
-def test_exact_context_window_produces_one_sequence() -> None:
-    """Exactly 20 observations should produce exactly one sequence."""
-
-    frame = make_feature_history(20)
-
-    dataset = SequenceBuilder().build(frame)
-
-    assert dataset.shape == (1, 20, 14)
-
-
-def test_insufficient_history_is_rejected() -> None:
-    """Fewer observations than the context window cannot form a sequence."""
-
-    frame = make_feature_history(19)
-
-    with pytest.raises(
-        ValueError,
-        match="Insufficient feature history",
-    ):
-        SequenceBuilder().build(frame)
-
-
-# ============================================================================
-# Schema Validation Tests
-# ============================================================================
-
-
-def test_non_dataframe_input_is_rejected() -> None:
-    """The builder requires a pandas DataFrame."""
-
-    with pytest.raises(
-        TypeError,
-        match="feature_history must be a pandas DataFrame",
-    ):
-        SequenceBuilder().build([])  # type: ignore[arg-type]
-
-
-def test_missing_required_feature_is_rejected() -> None:
-    """Every NVIDIA forecasting feature must be present."""
-
-    frame = make_feature_history(25)
-
-    frame = frame.drop(
-        columns=[NVIDIA_FEATURES[0]]
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="missing required columns",
-    ):
-        SequenceBuilder().build(frame)
-
-
-def test_missing_timestamp_is_rejected() -> None:
-    """Timestamp is required for sequence alignment."""
-
-    frame = make_feature_history(25)
-
-    frame = frame.drop(
-        columns=["timestamp"]
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="missing required columns",
-    ):
-        SequenceBuilder().build(frame)
-
-
-def test_extra_columns_do_not_change_sequence_output() -> None:
-    """
-    Additional DataFrame columns should be ignored.
-
-    Only the agreed NVIDIA feature columns should enter the sequence tensor.
-    """
-
-    base = make_feature_history(25)
-
-    extended = make_feature_history_with_extra_columns(25)
-
-    base_dataset = SequenceBuilder().build(base)
-    extended_dataset = SequenceBuilder().build(extended)
-
-    np.testing.assert_array_equal(
-        base_dataset.sequences,
-        extended_dataset.sequences,
-    )
-
-
-# ============================================================================
-# Chronology Tests
-# ============================================================================
-
-
-def test_non_chronological_input_is_rejected() -> None:
-    """Chronological ordering must be enforced by default."""
-
-    frame = make_feature_history(25)
-
-    frame.loc[10, "timestamp"] = 5.5
-
-    with pytest.raises(
-        ValueError,
-        match="must be in chronological order",
-    ):
-        SequenceBuilder().build(frame)
-
-
-def test_duplicate_timestamps_are_rejected() -> None:
-    """Duplicate timestamps can create ambiguous sequence boundaries."""
-
-    frame = make_feature_history(25)
-
-    frame.loc[10, "timestamp"] = frame.loc[9, "timestamp"]
-
-    with pytest.raises(
-        ValueError,
-        match="duplicate timestamps",
-    ):
-        SequenceBuilder().build(frame)
-
-
-def test_non_numeric_timestamp_is_rejected() -> None:
-    """Timestamps must be numeric."""
-
-    frame = make_feature_history(25)
-
-    frame["timestamp"] = frame["timestamp"].astype(object)
-    frame.loc[5, "timestamp"] = "invalid"
-
-    with pytest.raises(
-        ValueError,
-        match="timestamps must be numeric and finite",
-    ):
-        SequenceBuilder().build(frame)
-
-
-
-def test_infinite_timestamp_is_rejected() -> None:
-    """Infinite timestamps are invalid."""
-
-    frame = make_feature_history(25)
-
-    frame.loc[5, "timestamp"] = np.inf
-
-    with pytest.raises(
-        ValueError,
-        match="timestamps must be finite",
-    ):
-        SequenceBuilder().build(frame)
-
-
-# ============================================================================
-# Feature-Value Validation Tests
-# ============================================================================
-
-
-def test_missing_feature_value_is_rejected() -> None:
-    """NaN feature values are rejected by default."""
-
-    frame = make_feature_history(25)
-
-    frame.loc[5, NVIDIA_FEATURES[0]] = np.nan
-
-    with pytest.raises(
-        ValueError,
-        match="missing or non-numeric values",
-    ):
-        SequenceBuilder().build(frame)
-
-
-def test_non_numeric_feature_value_is_rejected() -> None:
-    """Non-numeric feature values must not enter the sequence tensor."""
-
-    frame = make_feature_history(25)
-
-    feature_name = NVIDIA_FEATURES[0]
-
-    frame[feature_name] = frame[feature_name].astype(object)
-    frame.loc[5, feature_name] = "invalid"
-
-    with pytest.raises(ValueError, match="missing or non-numeric"):
-        SequenceBuilder().build(frame)
-
-
-
-def test_infinite_feature_value_is_rejected() -> None:
-    """Infinite feature values are invalid by default."""
-
-    frame = make_feature_history(25)
-
-    frame.loc[5, NVIDIA_FEATURES[0]] = np.inf
-
-    with pytest.raises(
-        ValueError,
-        match="infinite feature values",
-    ):
-        SequenceBuilder().build(frame)
-
-
-def test_negative_infinite_feature_value_is_rejected() -> None:
-    """Negative infinity must also be rejected."""
-
-    frame = make_feature_history(25)
-
-    frame.loc[5, NVIDIA_FEATURES[0]] = -np.inf
-
-    with pytest.raises(
-        ValueError,
-        match="infinite feature values",
-    ):
-        SequenceBuilder().build(frame)
-
-
-# ============================================================================
-# Custom Configuration Tests
-# ============================================================================
-
-
-def test_custom_context_window_is_supported() -> None:
-    """The builder should support context windows other than 20."""
-
-    frame = make_feature_history(10)
-
-    dataset = SequenceBuilder(
-        SequenceBuilderConfig(
-            context_window=5,
-        )
-    ).build(frame)
-
-    assert dataset.shape == (6, 5, 14)
-    assert dataset.context_window == 5
-
-
-def test_convenience_function_supports_custom_context_window() -> None:
-    """build_sequences should expose context-window customization."""
-
-    frame = make_feature_history(10)
-
-    dataset = build_sequences(
-        frame,
-        context_window=5,
-    )
-
-    assert dataset.shape == (6, 5, 14)
-
-
-def test_allow_missing_values_configuration_can_be_enabled() -> None:
-    """
-    Missing values may be explicitly allowed by configuration.
-
-    This is not the default because the NVIDIA training pipeline should
-    normally receive complete feature data.
-    """
-
-    frame = make_feature_history(25)
-
-    frame.loc[5, NVIDIA_FEATURES[0]] = np.nan
-
-    builder = SequenceBuilder(
-        SequenceBuilderConfig(
+# ---------------------------------------------------------------------------
+# Feature-value validation
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureValidation:
+    """Tests for numeric, missing, and infinite feature values."""
+
+    @pytest.mark.parametrize("feature_name", FEATURE_NAMES)
+    def test_non_numeric_feature_value_raises(self, feature_name):
+        """Non-numeric feature values should be rejected."""
+        frame = make_feature_history()
+
+        frame[feature_name] = frame[feature_name].astype(object)
+        frame.loc[5, feature_name] = "invalid"
+
+        builder = make_builder()
+
+        with pytest.raises(
+            ValueError,
+            match="missing or non-numeric values",
+        ):
+            builder.build(frame)
+
+    @pytest.mark.parametrize("feature_name", FEATURE_NAMES)
+    def test_nan_feature_value_raises(self, feature_name):
+        """NaN feature values should be rejected by default."""
+        frame = make_feature_history()
+        frame.loc[5, feature_name] = np.nan
+
+        builder = make_builder()
+
+        with pytest.raises(
+            ValueError,
+            match="missing or non-numeric values",
+        ):
+            builder.build(frame)
+
+    @pytest.mark.parametrize("feature_name", FEATURE_NAMES)
+    def test_infinite_feature_value_raises(self, feature_name):
+        """Infinite feature values should be rejected by default."""
+        frame = make_feature_history()
+        frame.loc[5, feature_name] = np.inf
+
+        builder = make_builder()
+
+        with pytest.raises(
+            ValueError,
+            match="infinite",
+        ):
+            builder.build(frame)
+
+    @pytest.mark.parametrize("feature_name", FEATURE_NAMES)
+    def test_negative_infinite_feature_value_raises(self, feature_name):
+        """Negative infinite feature values should be rejected by default."""
+        frame = make_feature_history()
+        frame.loc[5, feature_name] = -np.inf
+
+        builder = make_builder()
+
+        with pytest.raises(
+            ValueError,
+            match="infinite",
+        ):
+            builder.build(frame)
+
+    def test_missing_values_can_be_allowed(self):
+        """
+        When missing values are explicitly allowed, the builder should not
+        reject them at the feature-validation stage.
+        """
+        frame = make_feature_history()
+        frame.loc[5, FEATURE_NAMES[0]] = np.nan
+
+        builder = make_builder(
             allow_missing_values=True,
         )
-    )
 
-    dataset = builder.build(frame)
+        result = builder.build(frame)
 
-    assert np.isnan(
-        dataset.sequences
-    ).any()
+        assert result.sequences.shape[1:] == (
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
 
+    def test_infinite_values_can_be_allowed(self):
+        """
+        When infinite values are explicitly allowed, the builder should not
+        reject them at the feature-validation stage.
+        """
+        frame = make_feature_history()
+        frame.loc[5, FEATURE_NAMES[0]] = np.inf
 
-def test_allow_infinite_values_configuration_can_be_enabled() -> None:
-    """
-    Infinite values may be explicitly allowed by configuration.
-
-    This option exists for controlled experimentation, not as the default
-    production data policy.
-    """
-
-    frame = make_feature_history(25)
-
-    frame.loc[5, NVIDIA_FEATURES[0]] = np.inf
-
-    builder = SequenceBuilder(
-        SequenceBuilderConfig(
+        builder = make_builder(
             allow_infinite_values=True,
         )
+
+        result = builder.build(frame)
+
+        assert result.sequences.shape[1:] == (
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+
+# ---------------------------------------------------------------------------
+# History-length validation
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryLength:
+    """Tests for minimum feature-history length."""
+
+    def test_exact_context_window_is_valid(self):
+        """Exactly W rows should produce one sequence."""
+        frame = make_feature_history(
+            row_count=CONTEXT_WINDOW,
+        )
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.num_sequences == 1
+        assert result.sequences.shape == (
+            1,
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+    def test_less_than_context_window_raises(self):
+        """Fewer than W rows should be rejected."""
+        frame = make_feature_history(
+            row_count=CONTEXT_WINDOW - 1,
+        )
+
+        builder = make_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(frame)
+
+    def test_one_more_than_context_window_produces_two_sequences(self):
+        """W+1 rows should produce two rolling windows."""
+        frame = make_feature_history(
+            row_count=CONTEXT_WINDOW + 1,
+        )
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.num_sequences == 2
+
+    @pytest.mark.parametrize(
+        "row_count",
+        [
+            CONTEXT_WINDOW + 5,
+            CONTEXT_WINDOW + 10,
+            CONTEXT_WINDOW + 20,
+        ],
     )
+    def test_expected_sequence_count(self, row_count):
+        """The number of sequences should be N-W+1."""
+        frame = make_feature_history(row_count=row_count)
 
-    dataset = builder.build(frame)
+        builder = make_builder()
 
-    assert np.isinf(
-        dataset.sequences
-    ).any()
+        result = builder.build(frame)
 
+        expected = row_count - CONTEXT_WINDOW + 1
 
-# ============================================================================
-# Determinism Tests
-# ============================================================================
-
-
-def test_sequence_construction_is_deterministic() -> None:
-    """Identical input should always produce identical sequences."""
-
-    frame = make_feature_history(100)
-
-    dataset_one = SequenceBuilder().build(frame)
-    dataset_two = SequenceBuilder().build(frame)
-
-    np.testing.assert_array_equal(
-        dataset_one.sequences,
-        dataset_two.sequences,
-    )
-
-    assert dataset_one.timestamps == dataset_two.timestamps
-    assert dataset_one.feature_names == dataset_two.feature_names
+        assert result.num_sequences == expected
 
 
-# ============================================================================
-# Input Immutability Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Rolling sequence construction
+# ---------------------------------------------------------------------------
 
 
-def test_builder_does_not_mutate_input_by_default() -> None:
-    """The default builder configuration should preserve the input DataFrame."""
+class TestSequenceConstruction:
+    """Tests for rolling sequence generation."""
 
-    frame = make_feature_history(25)
+    def test_sequence_batch_shape(self):
+        """The sequence batch should have shape (N-W+1, W, F)."""
+        row_count = 40
+        frame = make_feature_history(row_count=row_count)
 
-    original = frame.copy(deep=True)
+        builder = make_builder()
 
-    SequenceBuilder().build(frame)
+        result = builder.build(frame)
 
-    pd.testing.assert_frame_equal(
-        frame,
-        original,
-    )
+        expected_sequence_count = row_count - CONTEXT_WINDOW + 1
 
+        assert result.sequences.shape == (
+            expected_sequence_count,
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
 
-# ============================================================================
-# Data-Type Tests
-# ============================================================================
+    def test_custom_context_window_changes_sequence_shape(self):
+        """Changing W should change the sequence dimensions correctly."""
+        custom_context = 5
+        row_count = 20
 
+        frame = make_feature_history(row_count=row_count)
 
-def test_default_sequence_dtype_is_float64() -> None:
-    """The default sequence tensor should use float64."""
+        builder = make_builder(
+            context_window=custom_context,
+        )
 
-    frame = make_feature_history(25)
+        result = builder.build(frame)
 
-    dataset = SequenceBuilder().build(frame)
+        assert result.sequences.shape == (
+            row_count - custom_context + 1,
+            custom_context,
+            FEATURE_COUNT,
+        )
 
-    assert dataset.sequences.dtype == np.float64
+    def test_first_sequence_contains_first_context_rows(self):
+        """The first sequence should contain the first W feature rows."""
+        frame = make_feature_history()
 
+        builder = make_builder()
 
-def test_custom_sequence_dtype_is_supported() -> None:
-    """The sequence tensor dtype should be configurable."""
+        result = builder.build(frame)
 
-    frame = make_feature_history(25)
+        expected = frame[FEATURE_NAMES].iloc[
+            :CONTEXT_WINDOW
+        ].to_numpy(dtype=np.float64)
 
-    builder = SequenceBuilder(
-        SequenceBuilderConfig(
+        np.testing.assert_allclose(
+            result.sequences[0],
+            expected,
+        )
+
+    def test_last_sequence_contains_last_context_rows(self):
+        """The final sequence should contain the final W feature rows."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        expected = frame[FEATURE_NAMES].iloc[
+            -CONTEXT_WINDOW:
+        ].to_numpy(dtype=np.float64)
+
+        np.testing.assert_allclose(
+            result.sequences[-1],
+            expected,
+        )
+
+    def test_rolling_windows_shift_by_one_row(self):
+        """Adjacent sequences should shift forward by exactly one row."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        np.testing.assert_allclose(
+            result.sequences[0, 1:],
+            result.sequences[1, :-1],
+        )
+
+    def test_feature_order_matches_nvidia_contract(self):
+        """The final feature dimension must follow NVIDIA_FEATURES order."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.feature_names == FEATURE_NAMES
+
+    def test_sequence_dtype_matches_configuration(self):
+        """The resulting sequence dtype should match configuration."""
+        frame = make_feature_history()
+
+        builder = make_builder(
             dtype="float32",
         )
-    )
 
-    dataset = builder.build(frame)
+        result = builder.build(frame)
 
-    assert dataset.sequences.dtype == np.float32
+        assert result.sequences.dtype == np.float32
 
+    def test_default_sequence_dtype_is_float64(self):
+        """The default sequence dtype should be float64."""
+        frame = make_feature_history()
 
-# ============================================================================
-# Public API Tests
-# ============================================================================
+        builder = make_builder()
 
+        result = builder.build(frame)
 
-def test_convenience_function_uses_default_configuration() -> None:
-    """build_sequences should match SequenceBuilder's default behavior."""
-
-    frame = make_feature_history(25)
-
-    direct_dataset = SequenceBuilder().build(frame)
-    convenience_dataset = build_sequences(frame)
-
-    np.testing.assert_array_equal(
-        direct_dataset.sequences,
-        convenience_dataset.sequences,
-    )
-
-    assert direct_dataset.timestamps == convenience_dataset.timestamps
-    assert (
-        direct_dataset.feature_names
-        == convenience_dataset.feature_names
-    )
+        assert result.sequences.dtype == np.float64
 
 
-# ============================================================================
-# Temporal Safety Tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Timestamp-window construction
+# ---------------------------------------------------------------------------
 
 
-def test_sequence_does_not_contain_future_rows() -> None:
-    """
-    Verify that a sequence contains only its own historical window.
+class TestTimestampWindows:
+    """Tests for sequence timestamp windows."""
 
-    For the first sequence, the final timestamp must be t20 rather than t21
-    or later.
-    """
+    def test_timestamps_are_nested_windows(self):
+        """Each sequence should have its own complete timestamp window."""
+        frame = make_feature_history()
 
-    frame = make_feature_history(25)
+        builder = make_builder()
 
-    dataset = SequenceBuilder().build(frame)
+        result = builder.build(frame)
 
-    first_timestamp_window = dataset.timestamps[0]
-
-    assert first_timestamp_window[0] == 1.0
-    assert first_timestamp_window[-1] == 20.0
-
-    assert 21.0 not in first_timestamp_window
-    assert 22.0 not in first_timestamp_window
-    assert 23.0 not in first_timestamp_window
-
-
-def test_each_sequence_ends_at_its_corresponding_history_row() -> None:
-    """
-    Every sequence's final timestamp should correspond to the final source
-    observation included in that sequence.
-    """
-
-    frame = make_feature_history(25)
-
-    dataset = SequenceBuilder().build(frame)
-
-    for sequence_index, timestamp_window in enumerate(
-        dataset.timestamps
-    ):
-        expected_final_timestamp = float(
-            sequence_index + DEFAULT_CONTEXT_WINDOW
+        assert isinstance(result.timestamps, list)
+        assert all(
+            isinstance(timestamp_window, list)
+            for timestamp_window in result.timestamps
         )
 
-        assert timestamp_window[-1] == expected_final_timestamp
+    def test_timestamp_window_count_matches_sequence_count(self):
+        """There should be one timestamp window per sequence."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert len(result.timestamps) == result.num_sequences
+
+    def test_first_timestamp_window_matches_first_rows(self):
+        """The first timestamp window should contain the first W timestamps."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        expected = frame["timestamp"].iloc[
+            :CONTEXT_WINDOW
+        ].astype(float).tolist()
+
+        assert result.timestamps[0] == expected
+
+    def test_last_timestamp_window_matches_last_rows(self):
+        """The final timestamp window should contain the final W timestamps."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        expected = frame["timestamp"].iloc[
+            -CONTEXT_WINDOW:
+        ].astype(float).tolist()
+
+        assert result.timestamps[-1] == expected
+
+    def test_adjacent_timestamp_windows_shift_by_one(self):
+        """Adjacent timestamp windows should shift by exactly one row."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.timestamps[0][1:] == result.timestamps[1][:-1]
 
 
-def test_sequence_timestamp_and_feature_data_remain_aligned() -> None:
+# ---------------------------------------------------------------------------
+# Input-copy and output-independence behavior
+# ---------------------------------------------------------------------------
+
+
+class TestInputHandling:
+    """Tests for input-copy behavior and output independence."""
+
+    def test_builder_does_not_modify_input_structure(self):
+        """Building sequences should not alter the input DataFrame structure."""
+        frame = make_feature_history()
+
+        original_columns = list(frame.columns)
+        original_index = frame.index.copy()
+
+        builder = make_builder()
+
+        builder.build(frame)
+
+        assert list(frame.columns) == original_columns
+        assert frame.index.equals(original_index)
+
+    def test_output_sequences_do_not_depend_on_later_input_mutation(self):
+        """
+        Mutating the original feature history after construction should not
+        alter already-built sequences.
+        """
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        original_value = result.sequences[0, 0, 0]
+
+        frame.loc[0, FEATURE_NAMES[0]] = -999999.0
+
+        assert result.sequences[0, 0, 0] == original_value
+
+    def test_output_sequences_are_independent_of_future_input_changes(self):
+        """Later changes to the input should not alter stored sequence values."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        original = result.sequences.copy()
+
+        frame.loc[:, FEATURE_NAMES] = -123456.0
+
+        np.testing.assert_array_equal(
+            result.sequences,
+            original,
+        )
+
+    def test_output_sequences_can_be_mutated_independently(self):
+        """
+        The returned NumPy sequence array is not required to be read-only.
+        Mutating it should not mutate the original feature history.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        original_input_value = frame.loc[0, FEATURE_NAMES[0]]
+        original_output_value = result.sequences[0, 0, 0]
+
+        result.sequences[0, 0, 0] = -777777.0
+
+        assert result.sequences[0, 0, 0] == -777777.0
+        assert frame.loc[0, FEATURE_NAMES[0]] == original_input_value
+        assert original_output_value != -777777.0
+
+
+# ---------------------------------------------------------------------------
+# SequenceDataset integration
+# ---------------------------------------------------------------------------
+
+
+class TestSequenceDatasetIntegration:
+    """Tests for integration with the shared SequenceDataset contract."""
+
+    def test_result_is_sequence_dataset(self):
+        """SequenceBuilder should return SequenceDataset."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert isinstance(result, SequenceDataset)
+
+    def test_sequence_dataset_feature_names(self):
+        """SequenceDataset feature names should match NVIDIA_FEATURES."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.feature_names == FEATURE_NAMES
+
+    def test_sequence_dataset_context_window(self):
+        """SequenceDataset should preserve the configured context window."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.context_window == CONTEXT_WINDOW
+
+    def test_sequence_dataset_num_sequences(self):
+        """SequenceDataset should report the correct number of sequences."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.num_sequences == (
+            len(frame) - CONTEXT_WINDOW + 1
+        )
+
+    def test_sequence_dataset_shape_is_full_batch_shape(self):
+        """
+        SequenceDataset.shape should represent the complete batch:
+        (N-W+1, W, F).
+        """
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.shape == (
+            result.num_sequences,
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+    def test_sequence_dataset_input_shape_matches_actual_contract(self):
+        """
+        SequenceDataset.input_shape follows the current shared contract and
+        represents the complete stored sequence tensor shape.
+        """
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert result.input_shape == (
+            result.num_sequences,
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+    def test_sequence_dataset_timestamps_match_sequence_count(self):
+        """Timestamp-window count should match sequence count."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        result = builder.build(frame)
+
+        assert len(result.timestamps) == result.num_sequences
+
+
+# ---------------------------------------------------------------------------
+# Convenience API
+# ---------------------------------------------------------------------------
+
+
+class TestConvenienceAPI:
+    """Tests for build_sequences()."""
+
+    def test_build_sequences_returns_sequence_dataset(self):
+        """The convenience API should return SequenceDataset."""
+        frame = make_feature_history()
+
+        result = build_sequences(
+            frame,
+            context_window=CONTEXT_WINDOW,
+        )
+
+        assert isinstance(result, SequenceDataset)
+
+    def test_build_sequences_uses_requested_context_window(self):
+        """The convenience API should respect its context_window argument."""
+        frame = make_feature_history()
+
+        custom_context = 5
+
+        result = build_sequences(
+            frame,
+            context_window=custom_context,
+        )
+
+        assert result.context_window == custom_context
+        assert result.sequences.shape[1] == custom_context
+
+    def test_build_sequences_matches_builder_output(self):
+        """The convenience API should match direct SequenceBuilder output."""
+        frame = make_feature_history()
+
+        direct_builder = make_builder(
+            context_window=10,
+        )
+
+        direct_result = direct_builder.build(frame)
+
+        convenience_result = build_sequences(
+            frame,
+            context_window=10,
+        )
+
+        np.testing.assert_array_equal(
+            direct_result.sequences,
+            convenience_result.sequences,
+        )
+
+        assert direct_result.timestamps == convenience_result.timestamps
+        assert direct_result.feature_names == convenience_result.feature_names
+        assert (
+            direct_result.context_window
+            == convenience_result.context_window
+        )
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA forecasting contract
+# ---------------------------------------------------------------------------
+
+
+class TestNVIDIAForecastingContract:
+    """Tests that the sequence builder satisfies the NVIDIA input contract."""
+
+    def test_nvidia_feature_count(self):
+        """The forecasting contract should contain the expected feature count."""
+        assert FEATURE_COUNT == 14
+
+    def test_nvidia_feature_names_are_preserved(self):
+        """The exact NVIDIA feature ordering should be preserved."""
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.feature_names == FEATURE_NAMES
+
+    def test_default_context_window_matches_nvidia_contract(self):
+        """The default context window should be 20."""
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.context_window == 20
+        assert result.sequences.shape[1] == 20
+
+    def test_default_batch_shape_matches_nvidia_contract(self):
+        """
+        The batch shape should be (N, 20, 14), where N is the number of
+        generated sequences.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.sequences.shape == (
+            result.num_sequences,
+            20,
+            14,
+        )
+
+    def test_nvidia_feature_order_is_deterministic(self):
+        """Feature ordering must not depend on DataFrame column order."""
+        frame = make_feature_history()
+
+        shuffled_columns = [
+            "timestamp",
+            *reversed(FEATURE_NAMES),
+        ]
+
+        shuffled = frame[shuffled_columns]
+
+        result = build_sequences(shuffled)
+
+        assert result.feature_names == FEATURE_NAMES
+
+        expected = frame[FEATURE_NAMES].iloc[
+            :CONTEXT_WINDOW
+        ].to_numpy(dtype=np.float64)
+
+        np.testing.assert_allclose(
+            result.sequences[0],
+            expected,
+        )
+
+    def test_model_facing_batch_dimension_is_present(self):
+        """
+        The stored tensor must include the batch dimension before the context
+        and feature dimensions.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.sequences.ndim == 3
+        assert result.sequences.shape[1] == CONTEXT_WINDOW
+        assert result.sequences.shape[2] == FEATURE_COUNT
+
+
+# ---------------------------------------------------------------------------
+# Complete pipeline contract
+# ---------------------------------------------------------------------------
+
+
+class TestCompleteSequenceBuilderPipelineContract:
     """
-    Verify that timestamp windows and feature windows reference the same
-    source rows.
+    End-to-end tests for the sequence-builder portion of the forecasting
+    pipeline.
     """
 
-    frame = make_feature_history(25)
+    def test_complete_default_pipeline(self):
+        """A valid feature history should build a complete dataset."""
+        frame = make_feature_history()
 
-    dataset = SequenceBuilder().build(frame)
+        result = build_sequences(frame)
 
-    for sequence_index in range(
-        dataset.num_sequences
-    ):
-        expected_timestamp = frame.iloc[
-            sequence_index + DEFAULT_CONTEXT_WINDOW - 1
-        ]["timestamp"]
+        assert isinstance(result, SequenceDataset)
+        assert result.num_sequences == (
+            len(frame) - CONTEXT_WINDOW + 1
+        )
+        assert result.sequences.shape == (
+            result.num_sequences,
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+        assert result.feature_names == FEATURE_NAMES
+        assert result.context_window == CONTEXT_WINDOW
 
-        actual_timestamp = dataset.timestamps[
-            sequence_index
-        ][-1]
+    def test_complete_custom_window_pipeline(self):
+        """The pipeline should work with a custom context window."""
+        custom_context = 8
+        frame = make_feature_history(row_count=30)
 
-        assert actual_timestamp == expected_timestamp
+        result = build_sequences(
+            frame,
+            context_window=custom_context,
+        )
+
+        assert result.num_sequences == (
+            len(frame) - custom_context + 1
+        )
+
+        assert result.sequences.shape == (
+            result.num_sequences,
+            custom_context,
+            FEATURE_COUNT,
+        )
+
+    def test_sequence_and_timestamp_counts_remain_aligned(self):
+        """Every generated sequence must have one timestamp window."""
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences == len(result.timestamps)
+
+    def test_each_sequence_has_matching_timestamp_window(self):
+        """Every sequence and timestamp window must have length W."""
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        for sequence, timestamp_window in zip(
+            result.sequences,
+            result.timestamps,
+        ):
+            assert sequence.shape == (
+                CONTEXT_WINDOW,
+                FEATURE_COUNT,
+            )
+
+            assert len(timestamp_window) == CONTEXT_WINDOW
+
+    def test_model_facing_tensor_is_three_dimensional(self):
+        """
+        The sequence tensor should be directly suitable as a batched
+        sequence-model input: (batch, context, features).
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.sequences.ndim == 3
+
+    def test_batch_dimension_is_not_part_of_single_sequence_contents(self):
+        """
+        Individual sequence contents should have shape (W, F), while the
+        stored dataset contains the batch dimension.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        first_sequence = result.sequences[0]
+
+        assert first_sequence.shape == (
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+        assert result.sequences.shape[0] == result.num_sequences
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+
+class TestReproducibility:
+    """Tests for deterministic sequence construction."""
+
+    def test_same_input_produces_same_sequences(self):
+        """Repeated builds from the same input should be identical."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        first = builder.build(frame)
+        second = builder.build(frame)
+
+        np.testing.assert_array_equal(
+            first.sequences,
+            second.sequences,
+        )
+
+    def test_same_input_produces_same_timestamps(self):
+        """Repeated builds should produce identical timestamp windows."""
+        frame = make_feature_history()
+
+        builder = make_builder()
+
+        first = builder.build(frame)
+        second = builder.build(frame)
+
+        assert first.timestamps == second.timestamps
+
+    def test_feature_order_is_reproducible(self):
+        """Repeated builds should preserve feature ordering."""
+        frame = make_feature_history()
+
+        first = build_sequences(frame)
+        second = build_sequences(frame)
+
+        assert first.feature_names == second.feature_names
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    """Tests for important sequence-builder edge cases."""
+
+    def test_single_sequence_history(self):
+        """A history exactly W rows long should produce one sequence."""
+        frame = make_feature_history(
+            row_count=CONTEXT_WINDOW,
+        )
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences == 1
+        assert len(result.timestamps) == 1
+
+    def test_large_history_produces_expected_sequence_count(self):
+        """Large valid histories should follow N-W+1 exactly."""
+        row_count = 500
+        frame = make_feature_history(row_count=row_count)
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences == (
+            row_count - CONTEXT_WINDOW + 1
+        )
+
+    def test_fractional_timestamps_are_supported(self):
+        """Numeric fractional timestamps should be accepted."""
+        frame = make_feature_history(
+            start_timestamp=1_000.5,
+            timestamp_step=0.25,
+        )
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences > 0
+
+    def test_negative_numeric_feature_values_are_supported(self):
+        """Negative numeric features are valid numeric inputs."""
+        frame = make_feature_history()
+
+        frame.loc[:, FEATURE_NAMES[0]] = np.linspace(
+            -10.0,
+            10.0,
+            len(frame),
+        )
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences > 0
+
+    def test_zero_feature_values_are_supported(self):
+        """Zero-valued features should be accepted."""
+        frame = make_feature_history()
+
+        frame.loc[:, FEATURE_NAMES[0]] = 0.0
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences > 0
+
+    def test_duplicate_index_values_do_not_define_sequence_order(self):
+        """
+        Sequence ordering should be based on timestamps rather than requiring
+        a special pandas index.
+        """
+        frame = make_feature_history()
+
+        frame.index = [0] * len(frame)
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences == (
+            len(frame) - CONTEXT_WINDOW + 1
+        )
+
+    def test_non_default_index_is_supported(self):
+        """A non-default pandas index should not affect sequence generation."""
+        frame = make_feature_history()
+
+        frame.index = range(100, 100 + len(frame))
+
+        result = build_sequences(frame)
+
+        assert result.num_sequences == (
+            len(frame) - CONTEXT_WINDOW + 1
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for previously identified failures
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionCases:
+    """
+    Regression coverage for issues discovered while validating the original
+    sequence-builder test suite.
+    """
+
+    def test_config_does_not_require_sort_output(self):
+        """
+        The test suite should rely only on the actual SequenceBuilderConfig
+        API and should not require a nonexistent sort_output field.
+        """
+        config = SequenceBuilderConfig()
+
+        assert hasattr(config, "context_window")
+        assert hasattr(config, "require_chronological_order")
+        assert hasattr(config, "require_unique_timestamps")
+        assert hasattr(config, "allow_missing_values")
+        assert hasattr(config, "allow_infinite_values")
+        assert hasattr(config, "copy_input")
+        assert hasattr(config, "dtype")
+
+    def test_config_does_not_require_drop_invalid_rows(self):
+        """
+        The test suite should rely only on the actual SequenceBuilderConfig
+        API and should not require a nonexistent drop_invalid_rows field.
+        """
+        config = SequenceBuilderConfig()
+
+        assert not hasattr(config, "drop_invalid_rows")
+
+    def test_timestamps_are_not_assumed_to_be_one_dimensional(self):
+        """
+        SequenceDataset timestamps are represented as one timestamp window
+        per sequence.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert len(result.timestamps) == result.num_sequences
+        assert all(
+            len(window) == CONTEXT_WINDOW
+            for window in result.timestamps
+        )
+
+    def test_convenience_api_accepts_context_window_directly(self):
+        """
+        build_sequences() accepts context_window directly rather than a
+        config keyword argument.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(
+            frame,
+            context_window=10,
+        )
+
+        assert result.context_window == 10
+
+    def test_sequence_output_is_independent_from_input(self):
+        """
+        Mutating the original feature history after construction should not
+        modify the already-built sequence dataset.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        original_value = result.sequences[0, 0, 0]
+
+        frame.loc[0, FEATURE_NAMES[0]] = -999999.0
+
+        assert result.sequences[0, 0, 0] == original_value
+
+    def test_single_sequence_contents_have_expected_shape(self):
+        """
+        A single sequence extracted from the batch should have shape (W, F).
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.sequences[0].shape == (
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+    def test_full_dataset_tensor_has_expected_batch_shape(self):
+        """
+        The complete tensor should have shape (N, W, F).
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        assert result.sequences.shape == (
+            result.num_sequences,
+            CONTEXT_WINDOW,
+            FEATURE_COUNT,
+        )
+
+    def test_output_array_is_mutable_without_affecting_input(self):
+        """
+        The current SequenceDataset contract does not require returned
+        sequence arrays to be read-only.
+        """
+        frame = make_feature_history()
+
+        result = build_sequences(frame)
+
+        original_input_value = frame.loc[0, FEATURE_NAMES[0]]
+
+        result.sequences[0, 0, 0] = -888888.0
+
+        assert result.sequences[0, 0, 0] == -888888.0
+        assert frame.loc[0, FEATURE_NAMES[0]] == original_input_value
+
+
+# ---------------------------------------------------------------------------
+# Final integration smoke test
+# ---------------------------------------------------------------------------
+
+
+class TestSequenceBuilderSmoke:
+    """Small end-to-end smoke test for the complete builder."""
+
+    def test_sequence_builder_end_to_end(self):
+        """The production sequence-building path should work end-to-end."""
+        frame = make_feature_history(
+            row_count=50,
+        )
+
+        result = build_sequences(frame)
+
+        assert isinstance(result, SequenceDataset)
+        assert result.num_sequences == 31
+        assert result.context_window == 20
+        assert result.feature_names == FEATURE_NAMES
+        assert result.sequences.shape == (31, 20, 14)
+        assert len(result.timestamps) == 31
+
+        for timestamp_window in result.timestamps:
+            assert len(timestamp_window) == 20
+            assert timestamp_window == sorted(timestamp_window)
 

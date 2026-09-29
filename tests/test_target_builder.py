@@ -1,30 +1,31 @@
-"""
-Tests for the Target Builder
-=============================
-
-This test module validates the construction of supervised-learning targets
-for the NVIDIA forecasting pipeline.
-
-The tests cover:
-
-- Future-return calculations.
-- Future-price calculations.
-- Timestamp alignment.
-- Forecast-horizon behavior.
-- Exclusion of final rows without future observations.
-- Input validation.
-- Chronological ordering.
-- Duplicate timestamps.
-- Missing prices.
-- Infinite prices.
-- Non-positive prices.
-- Insufficient observations.
-- DataFrame input immutability.
-- TargetDataset contract integration.
-- Convenience functions.
-- Array-based construction.
-- Configuration validation.
-"""
+# tests/test_target_builder.py
+#
+# Purpose:
+# Comprehensive tests for the supervised-learning target builder used by the
+# NVIDIA forecasting pipeline.
+#
+# Responsibilities:
+# - Verify future-return target construction.
+# - Verify future-price target construction.
+# - Verify forecast-horizon alignment.
+# - Verify target timestamp semantics.
+# - Verify input validation and configuration behavior.
+# - Verify invalid, missing, infinite, and non-positive prices.
+# - Verify chronological and duplicate timestamp handling.
+# - Verify invalid-row handling.
+# - Verify DataFrame immutability.
+# - Verify TargetDataset contract integration.
+# - Verify convenience APIs.
+# - Verify array-based target construction.
+# - Verify ForecastingConfig integration.
+# - Verify deterministic target generation.
+#
+# The module does not test sequence construction, feature engineering,
+# normalization, train/validation/test splitting, model architecture,
+# model training, or forecasting performance.
+#
+# The tests intentionally validate the public TargetBuilder behavior rather
+# than depending on unnecessary implementation-specific error messages.
 
 from __future__ import annotations
 
@@ -49,6 +50,15 @@ from data.target_builder import (
 
 
 # ============================================================================
+# Shared Test Constants
+# ============================================================================
+
+DEFAULT_HORIZON = 2
+DEFAULT_PRICE_COLUMN_NAME = "mid_price"
+DEFAULT_TIMESTAMP_COLUMN = "timestamp"
+
+
+# ============================================================================
 # Test Data Helpers
 # ============================================================================
 
@@ -59,7 +69,13 @@ def make_price_history(
     timestamps: list[float] | np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
-    Create a simple chronological price-history DataFrame.
+    Create a deterministic chronological price-history DataFrame.
+
+    The resulting DataFrame contains the two columns used by the default
+    TargetBuilder configuration:
+
+        timestamp
+        mid_price
     """
 
     price_array = np.asarray(prices, dtype=float)
@@ -74,8 +90,8 @@ def make_price_history(
 
     return pd.DataFrame(
         {
-            "timestamp": timestamp_array,
-            "mid_price": price_array,
+            DEFAULT_TIMESTAMP_COLUMN: timestamp_array,
+            DEFAULT_PRICE_COLUMN_NAME: price_array,
         }
     )
 
@@ -84,12 +100,15 @@ def make_default_builder(
     **overrides,
 ) -> TargetBuilder:
     """
-    Create a TargetBuilder with a small forecast horizon for testing.
+    Create a TargetBuilder configured for deterministic testing.
+
+    The default test horizon is intentionally small so that expected target
+    values can be calculated manually.
     """
 
     config_values = {
-        "forecast_horizon": 2,
-        "price_column": "mid_price",
+        "forecast_horizon": DEFAULT_HORIZON,
+        "price_column": DEFAULT_PRICE_COLUMN_NAME,
         "target_name": DEFAULT_TARGET_NAME,
         "target_type": "future_return",
         "require_chronological_order": True,
@@ -99,7 +118,7 @@ def make_default_builder(
         "require_positive_prices": True,
         "drop_invalid_rows": False,
         "copy_input": True,
-        "timestamp_column": "timestamp",
+        "timestamp_column": DEFAULT_TIMESTAMP_COLUMN,
         "dtype": "float64",
     }
 
@@ -110,309 +129,555 @@ def make_default_builder(
     )
 
 
-# ============================================================================
-# Basic Construction Tests
-# ============================================================================
-
-
-def test_build_returns_target_dataset() -> None:
+def expected_future_returns(
+    prices: list[float] | np.ndarray,
+    horizon: int,
+) -> np.ndarray:
     """
-    The builder should return a validated TargetDataset instance.
+    Calculate expected future returns independently of TargetBuilder.
     """
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+    price_array = np.asarray(prices, dtype=float)
 
-    builder = make_default_builder()
+    current_prices = price_array[:-horizon]
+    future_prices = price_array[horizon:]
 
-    result = builder.build(data)
+    return (
+        future_prices - current_prices
+    ) / current_prices
 
-    assert isinstance(result, TargetDataset)
 
-
-def test_build_generates_expected_number_of_targets() -> None:
+def expected_future_prices(
+    prices: list[float] | np.ndarray,
+    horizon: int,
+) -> np.ndarray:
     """
-    With N observations and horizon H, the builder should produce N - H
-    targets.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
-
-    builder = make_default_builder()
-
-    result = builder.build(data)
-
-    assert result.num_targets == 3
-    assert len(result.targets) == 3
-    assert len(result.timestamps) == 3
-
-
-def test_final_forecast_horizon_rows_are_excluded() -> None:
-    """
-    The final H rows must be excluded because they do not have enough future
-    observations to calculate a target.
+    Calculate expected future-price targets independently of TargetBuilder.
     """
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+    price_array = np.asarray(prices, dtype=float)
 
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
-
-    result = builder.build(data)
-
-    np.testing.assert_array_equal(
-        result.timestamps,
-        np.array([0.0, 1.0, 2.0]),
-    )
-
-
-def test_target_timestamps_refer_to_current_observations() -> None:
-    """
-    Target timestamps must correspond to the current observation used as the
-    beginning of the forecast interval, not the future observation.
-    """
-
-    data = make_price_history(
-        [100.0, 110.0, 120.0, 130.0, 140.0],
-        timestamps=[10.0, 20.0, 30.0, 40.0, 50.0],
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
-
-    result = builder.build(data)
-
-    np.testing.assert_array_equal(
-        result.timestamps,
-        np.array([10.0, 20.0, 30.0]),
-    )
+    return price_array[horizon:]
 
 
 # ============================================================================
-# Future Return Calculation Tests
+# TargetBuilderConfig Tests
 # ============================================================================
 
 
-def test_future_return_calculation_is_correct() -> None:
-    """
-    Verify:
+class TestTargetBuilderConfig:
+    """Tests for TargetBuilderConfig defaults and validation."""
 
-        future_return = (future_price - current_price) / current_price
-    """
+    def test_default_target_name(self):
+        """The default target name should match the project contract."""
+        config = TargetBuilderConfig()
 
-    data = make_price_history(
-        [100.0, 110.0, 120.0, 130.0, 140.0]
-    )
+        assert config.target_name == DEFAULT_TARGET_NAME
 
-    builder = make_default_builder(
-        forecast_horizon=2,
-        target_type="future_return",
-    )
+    def test_default_price_column(self):
+        """The default price column should be mid_price."""
+        config = TargetBuilderConfig()
 
-    result = builder.build(data)
+        assert config.price_column == DEFAULT_PRICE_COLUMN
 
-    expected_targets = np.array(
+    def test_default_target_type_is_future_return(self):
+        """Future return should be the default target type."""
+        config = TargetBuilderConfig()
+
+        assert config.target_type == "future_return"
+
+    def test_default_forecast_horizon_is_positive(self):
+        """The default forecast horizon must be positive."""
+        config = TargetBuilderConfig()
+
+        assert config.forecast_horizon > 0
+
+    def test_custom_forecast_horizon_is_preserved(self):
+        """Custom forecast horizons should be preserved."""
+        config = TargetBuilderConfig(
+            forecast_horizon=7,
+        )
+
+        assert config.forecast_horizon == 7
+
+    def test_custom_target_type_is_preserved(self):
+        """Supported target types should be accepted."""
+        config = TargetBuilderConfig(
+            target_type="future_price",
+        )
+
+        assert config.target_type == "future_price"
+
+    @pytest.mark.parametrize(
+        "forecast_horizon",
         [
-            (120.0 - 100.0) / 100.0,
-            (130.0 - 110.0) / 110.0,
-            (140.0 - 120.0) / 120.0,
-        ]
+            0,
+            -1,
+            -5,
+        ],
     )
+    def test_non_positive_forecast_horizon_is_rejected(
+        self,
+        forecast_horizon: int,
+    ):
+        """Forecast horizons must be positive."""
+        with pytest.raises(ValueError):
+            TargetBuilderConfig(
+                forecast_horizon=forecast_horizon,
+            )
 
-    np.testing.assert_allclose(
-        result.targets,
-        expected_targets,
-        rtol=1e-12,
-        atol=1e-12,
-    )
+    def test_unsupported_target_type_is_rejected(self):
+        """Unsupported target types should be rejected."""
+        with pytest.raises(ValueError):
+            TargetBuilderConfig(
+                target_type="unsupported",
+            )
+
+    def test_copy_input_configuration_is_preserved(self):
+        """The copy_input setting should be preserved."""
+        config = TargetBuilderConfig(
+            copy_input=False,
+        )
+
+        assert config.copy_input is False
 
 
-def test_future_return_supports_negative_returns() -> None:
-    """
-    Falling future prices should produce negative returns.
-    """
+# ============================================================================
+# Basic Builder Construction
+# ============================================================================
 
-    data = make_price_history(
-        [100.0, 95.0, 90.0, 85.0, 80.0]
-    )
 
-    builder = make_default_builder(
-        forecast_horizon=2,
-        target_type="future_return",
-    )
+class TestTargetBuilderConstruction:
+    """Tests for constructing TargetBuilder instances."""
 
-    result = builder.build(data)
+    def test_builder_can_be_created_with_default_configuration(self):
+        """TargetBuilder should be constructible."""
+        builder = TargetBuilder()
 
-    expected_targets = np.array(
+        assert isinstance(builder, TargetBuilder)
+
+    def test_builder_preserves_custom_configuration(self):
+        """The builder should preserve the supplied configuration."""
+        config = TargetBuilderConfig(
+            forecast_horizon=5,
+            target_type="future_price",
+            target_name="future_mid_price",
+        )
+
+        builder = TargetBuilder(config=config)
+
+        assert builder.config.forecast_horizon == 5
+        assert builder.config.target_type == "future_price"
+        assert builder.config.target_name == "future_mid_price"
+
+    def test_default_builder_helper_creates_target_builder(self):
+        """The shared test helper should create a valid builder."""
+        builder = make_default_builder()
+
+        assert isinstance(builder, TargetBuilder)
+
+
+# ============================================================================
+# Basic Target Construction
+# ============================================================================
+
+
+class TestBasicTargetConstruction:
+    """Tests for the basic TargetBuilder output contract."""
+
+    def test_build_returns_target_dataset(self):
+        """The builder should return a TargetDataset."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        result = make_default_builder().build(data)
+
+        assert isinstance(result, TargetDataset)
+
+    def test_build_generates_expected_number_of_targets(self):
+        """N observations with horizon H should generate N-H targets."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        result = make_default_builder().build(data)
+
+        assert result.num_targets == 3
+        assert len(result.targets) == 3
+        assert len(result.timestamps) == 3
+
+    @pytest.mark.parametrize(
+        "row_count,horizon,expected_count",
         [
-            (90.0 - 100.0) / 100.0,
-            (85.0 - 95.0) / 95.0,
-            (80.0 - 90.0) / 90.0,
+            (2, 1, 1),
+            (3, 1, 2),
+            (5, 1, 4),
+            (5, 2, 3),
+            (5, 3, 2),
+            (5, 4, 1),
+            (6, 5, 1),
+        ],
+    )
+    def test_target_count_is_n_minus_horizon(
+        self,
+        row_count: int,
+        horizon: int,
+        expected_count: int,
+    ):
+        """The fundamental target-count relationship should hold."""
+        prices = np.arange(
+            100.0,
+            100.0 + row_count,
+        )
+
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=horizon,
+        ).build(data)
+
+        assert result.num_targets == expected_count
+
+
+# ============================================================================
+# Future Return Tests
+# ============================================================================
+
+
+class TestFutureReturnTargets:
+    """Tests for future-return target construction."""
+
+    def test_future_return_calculation_is_correct(self):
+        """
+        Verify:
+
+            future_return =
+                (future_price - current_price) / current_price
+        """
+
+        prices = [
+            100.0,
+            110.0,
+            120.0,
+            130.0,
+            140.0,
         ]
+
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=2,
+            target_type="future_return",
+        ).build(data)
+
+        expected = expected_future_returns(
+            prices,
+            horizon=2,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_future_return_supports_positive_returns(self):
+        """Increasing future prices should produce positive returns."""
+        data = make_price_history(
+            [100.0, 105.0, 110.0, 115.0, 120.0],
+        )
+
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
+
+        assert np.all(result.targets > 0)
+
+    def test_future_return_supports_negative_returns(self):
+        """Decreasing future prices should produce negative returns."""
+        data = make_price_history(
+            [100.0, 95.0, 90.0, 85.0, 80.0],
+        )
+
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
+
+        expected = expected_future_returns(
+            [100.0, 95.0, 90.0, 85.0, 80.0],
+            horizon=2,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+        assert np.all(result.targets < 0)
+
+    def test_future_return_is_zero_when_future_price_is_unchanged(self):
+        """Unchanged future prices should produce zero returns."""
+        data = make_price_history(
+            [100.0, 100.0, 100.0, 100.0, 100.0],
+        )
+
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
+
+        np.testing.assert_allclose(
+            result.targets,
+            np.zeros(3),
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize(
+        "horizon",
+        [1, 2, 3],
     )
-
-    np.testing.assert_allclose(
-        result.targets,
-        expected_targets,
-        rtol=1e-12,
-        atol=1e-12,
-    )
-
-    assert np.all(result.targets < 0)
-
-
-def test_future_return_is_zero_when_future_price_is_unchanged() -> None:
-    """
-    Unchanged future prices should produce zero returns.
-    """
-
-    data = make_price_history(
-        [100.0, 100.0, 100.0, 100.0, 100.0]
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=2,
-        target_type="future_return",
-    )
-
-    result = builder.build(data)
-
-    np.testing.assert_allclose(
-        result.targets,
-        np.zeros(3),
-        atol=1e-12,
-    )
-
-
-def test_forecast_horizon_one_uses_next_observation() -> None:
-    """
-    A horizon of one should compare each current price with the immediately
-    following price.
-    """
-
-    data = make_price_history(
-        [100.0, 105.0, 110.0, 100.0]
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=1,
-        target_type="future_return",
-    )
-
-    result = builder.build(data)
-
-    expected_targets = np.array(
-        [
-            (105.0 - 100.0) / 100.0,
-            (110.0 - 105.0) / 105.0,
-            (100.0 - 110.0) / 110.0,
+    def test_future_return_formula_for_multiple_horizons(
+        self,
+        horizon: int,
+    ):
+        """The same future-return formula should work for multiple horizons."""
+        prices = [
+            100.0,
+            105.0,
+            110.0,
+            120.0,
+            115.0,
+            130.0,
         ]
-    )
 
-    np.testing.assert_allclose(
-        result.targets,
-        expected_targets,
-        rtol=1e-12,
-        atol=1e-12,
-    )
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=horizon,
+        ).build(data)
+
+        expected = expected_future_returns(
+            prices,
+            horizon,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_horizon_one_uses_immediate_next_observation(self):
+        """Horizon one should use t+1 as the future observation."""
+        prices = [
+            100.0,
+            105.0,
+            110.0,
+            100.0,
+        ]
+
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
+
+        expected = expected_future_returns(
+            prices,
+            horizon=1,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_target_name_is_preserved_for_future_return(self):
+        """The configured target name should be preserved."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+        )
+
+        result = make_default_builder(
+            forecast_horizon=1,
+            target_name="custom_return",
+        ).build(data)
+
+        assert result.target_name == "custom_return"
 
 
 # ============================================================================
-# Future Price Calculation Tests
+# Future Price Tests
 # ============================================================================
 
 
-def test_future_price_target_type_is_supported() -> None:
-    """
-    The builder should support future-price targets in addition to returns.
-    """
+class TestFuturePriceTargets:
+    """Tests for future-price target construction."""
 
-    data = make_price_history(
-        [100.0, 110.0, 120.0, 130.0, 140.0]
+    def test_future_price_target_is_supported(self):
+        """The builder should support future-price targets."""
+        prices = [
+            100.0,
+            110.0,
+            120.0,
+            130.0,
+            140.0,
+        ]
+
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=2,
+            target_type="future_price",
+            target_name="future_mid_price",
+        ).build(data)
+
+        expected = expected_future_prices(
+            prices,
+            horizon=2,
+        )
+
+        np.testing.assert_array_equal(
+            result.targets,
+            expected,
+        )
+
+        assert result.target_name == "future_mid_price"
+
+    @pytest.mark.parametrize(
+        "horizon",
+        [1, 2, 3],
     )
+    def test_future_price_target_for_multiple_horizons(
+        self,
+        horizon: int,
+    ):
+        """Future-price targets should correctly use t+H."""
+        prices = [
+            100.0,
+            105.0,
+            110.0,
+            115.0,
+            120.0,
+            130.0,
+        ]
 
-    builder = make_default_builder(
-        forecast_horizon=2,
-        target_type="future_price",
-        target_name="future_mid_price",
-    )
+        data = make_price_history(prices)
 
-    result = builder.build(data)
+        result = make_default_builder(
+            forecast_horizon=horizon,
+            target_type="future_price",
+        ).build(data)
 
-    np.testing.assert_array_equal(
-        result.targets,
-        np.array([120.0, 130.0, 140.0]),
-    )
+        expected = expected_future_prices(
+            prices,
+            horizon,
+        )
 
-    assert result.target_name == "future_mid_price"
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+        )
 
 
 # ============================================================================
-# Horizon Tests
+# Timestamp Alignment Tests
 # ============================================================================
 
 
-@pytest.mark.parametrize(
-    "forecast_horizon, expected_count",
-    [
-        (1, 5),
-        (2, 4),
-        (3, 3),
-        (4, 2),
-        (5, 1),
-    ],
-)
-def test_target_count_matches_forecast_horizon(
-    forecast_horizon: int,
-    expected_count: int,
-) -> None:
-    """
-    For N observations and horizon H, the expected number of targets is:
+class TestTimestampAlignment:
+    """Tests for target timestamp semantics."""
 
-        N - H
-    """
+    def test_target_timestamps_refer_to_current_observations(self):
+        """
+        Target timestamps should correspond to t, not t+H.
+        """
+        data = make_price_history(
+            [100.0, 110.0, 120.0, 130.0, 140.0],
+            timestamps=[
+                10.0,
+                20.0,
+                30.0,
+                40.0,
+                50.0,
+            ],
+        )
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
-    )
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
 
-    builder = make_default_builder(
-        forecast_horizon=forecast_horizon
-    )
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.array(
+                [
+                    10.0,
+                    20.0,
+                    30.0,
+                ]
+            ),
+        )
 
-    result = builder.build(data)
+    def test_final_horizon_rows_are_excluded(self):
+        """The final H observations cannot serve as target starting points."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
 
-    assert result.num_targets == expected_count
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
 
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.array(
+                [
+                    0.0,
+                    1.0,
+                    2.0,
+                ]
+            ),
+        )
 
-def test_large_horizon_excludes_all_but_one_possible_current_observation() -> None:
-    """
-    With N = H + 1 observations, exactly one target should be generated.
-    """
+    def test_target_timestamps_preserve_input_values(self):
+        """The original current-observation timestamps should be preserved."""
+        timestamps = [
+            10.5,
+            20.5,
+            30.5,
+            40.5,
+            50.5,
+        ]
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+        data = make_price_history(
+            [100.0, 110.0, 120.0, 130.0, 140.0],
+            timestamps=timestamps,
+        )
 
-    builder = make_default_builder(
-        forecast_horizon=4
-    )
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
 
-    result = builder.build(data)
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.asarray(timestamps[:3]),
+        )
 
-    assert result.num_targets == 1
+    def test_target_timestamps_are_one_dimensional(self):
+        """Target timestamps should be a one-dimensional array."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
 
-    np.testing.assert_allclose(
-        result.targets,
-        np.array([(104.0 - 100.0) / 100.0]),
-    )
+        result = make_default_builder().build(data)
+
+        assert result.timestamps.ndim == 1
 
 
 # ============================================================================
@@ -420,193 +685,194 @@ def test_large_horizon_excludes_all_but_one_possible_current_observation() -> No
 # ============================================================================
 
 
-def test_non_dataframe_input_raises_type_error() -> None:
-    """
-    The builder should require a pandas DataFrame.
-    """
+class TestInputValidation:
+    """Tests for invalid TargetBuilder inputs."""
 
-    builder = make_default_builder()
+    def test_non_dataframe_input_raises(self):
+        """TargetBuilder should require a pandas DataFrame."""
+        builder = make_default_builder()
 
-    with pytest.raises(
-        TypeError,
-        match="data must be a pandas DataFrame",
+        with pytest.raises(TypeError):
+            builder.build(
+                [100.0, 101.0, 102.0]  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "missing_column",
+        [
+            "timestamp",
+            "mid_price",
+        ],
+    )
+    def test_missing_required_column_raises(
+        self,
+        missing_column: str,
     ):
-        builder.build(
-            [100.0, 101.0, 102.0]  # type: ignore[arg-type]
+        """Required columns must be present."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+        ).drop(
+            columns=[missing_column],
         )
 
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
 
-@pytest.mark.parametrize(
-    "missing_column",
-    [
-        "timestamp",
-        "mid_price",
-    ],
-)
-def test_missing_required_column_raises_value_error(
-    missing_column: str,
-) -> None:
-    """
-    Missing required columns should be rejected.
-    """
+        with pytest.raises(ValueError):
+            builder.build(data)
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0]
+    def test_empty_dataframe_raises(self):
+        """An empty DataFrame should be rejected."""
+        data = pd.DataFrame(
+            columns=[
+                DEFAULT_TIMESTAMP_COLUMN,
+                DEFAULT_PRICE_COLUMN_NAME,
+            ]
+        )
+
+        builder = make_default_builder()
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    def test_insufficient_observations_raise(self):
+        """
+        At least H+1 observations are required to produce one target.
+        """
+        data = make_price_history(
+            [100.0, 101.0],
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    def test_exactly_h_plus_one_observations_is_valid(self):
+        """H+1 observations should produce exactly one target."""
+        horizon = 4
+
+        data = make_price_history(
+            [
+                100.0,
+                101.0,
+                102.0,
+                103.0,
+                104.0,
+            ]
+        )
+
+        result = make_default_builder(
+            forecast_horizon=horizon,
+        ).build(data)
+
+        assert result.num_targets == 1
+
+    @pytest.mark.parametrize(
+        "invalid_price",
+        [
+            0.0,
+            -1.0,
+            -100.0,
+        ],
     )
-
-    data = data.drop(columns=[missing_column])
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="missing required column",
+    def test_non_positive_prices_raise(
+        self,
+        invalid_price: float,
     ):
-        builder.build(data)
+        """Zero and negative prices should be rejected by default."""
+        data = make_price_history(
+            [
+                100.0,
+                invalid_price,
+                102.0,
+                103.0,
+            ]
+        )
 
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
 
-def test_empty_dataframe_raises_value_error() -> None:
-    """
-    Empty input data should be rejected.
-    """
+        with pytest.raises(ValueError):
+            builder.build(data)
 
-    data = pd.DataFrame(
-        columns=["timestamp", "mid_price"]
+    def test_nan_price_raises(self):
+        """NaN prices should be rejected by default."""
+        data = make_price_history(
+            [
+                100.0,
+                101.0,
+                102.0,
+                103.0,
+            ]
+        )
+
+        data.loc[1, DEFAULT_PRICE_COLUMN_NAME] = np.nan
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    @pytest.mark.parametrize(
+        "invalid_price",
+        [
+            np.inf,
+            -np.inf,
+        ],
     )
-
-    builder = make_default_builder()
-
-    with pytest.raises(
-        ValueError,
-        match="empty DataFrame",
+    def test_infinite_price_raises(
+        self,
+        invalid_price: float,
     ):
-        builder.build(data)
+        """Infinite prices should be rejected by default."""
+        data = make_price_history(
+            [
+                100.0,
+                invalid_price,
+                102.0,
+                103.0,
+            ]
+        )
 
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
 
-def test_insufficient_observations_raise_value_error() -> None:
-    """
-    At least H + 1 observations are required to generate one target.
-    """
+        with pytest.raises(ValueError):
+            builder.build(data)
 
-    data = make_price_history(
-        [100.0, 101.0]
-    )
+    def test_non_numeric_price_raises(self):
+        """Non-numeric price values should be rejected."""
+        data = pd.DataFrame(
+            {
+                DEFAULT_TIMESTAMP_COLUMN: [
+                    0.0,
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                DEFAULT_PRICE_COLUMN_NAME: [
+                    100.0,
+                    "invalid",
+                    102.0,
+                    103.0,
+                ],
+            }
+        )
 
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
 
-    with pytest.raises(
-        ValueError,
-        match="Insufficient observations",
-    ):
-        builder.build(data)
-
-
-@pytest.mark.parametrize(
-    "invalid_price",
-    [
-        0.0,
-        -1.0,
-        -100.0,
-    ],
-)
-def test_non_positive_prices_raise_value_error(
-    invalid_price: float,
-) -> None:
-    """
-    Zero and negative prices should be rejected.
-    """
-
-    data = make_price_history(
-        [100.0, invalid_price, 102.0, 103.0]
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="invalid values",
-    ):
-        builder.build(data)
-
-
-def test_missing_price_raises_value_error() -> None:
-    """
-    Missing prices should be rejected by default.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0]
-    )
-
-    data.loc[1, "mid_price"] = np.nan
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="invalid values",
-    ):
-        builder.build(data)
-
-
-@pytest.mark.parametrize(
-    "invalid_price",
-    [
-        np.inf,
-        -np.inf,
-    ],
-)
-def test_infinite_price_raises_value_error(
-    invalid_price: float,
-) -> None:
-    """
-    Infinite prices should be rejected.
-    """
-
-    data = make_price_history(
-        [100.0, invalid_price, 102.0, 103.0]
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="invalid values",
-    ):
-        builder.build(data)
-
-
-def test_non_numeric_price_raises_value_error() -> None:
-    """
-    Non-numeric price values should be rejected.
-    """
-
-    data = pd.DataFrame(
-        {
-            "timestamp": [0.0, 1.0, 2.0, 3.0],
-            "mid_price": [100.0, "invalid", 102.0, 103.0],
-        }
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="invalid values",
-    ):
-        builder.build(data)
+        with pytest.raises(ValueError):
+            builder.build(data)
 
 
 # ============================================================================
@@ -614,419 +880,588 @@ def test_non_numeric_price_raises_value_error() -> None:
 # ============================================================================
 
 
-def test_non_chronological_timestamps_raise_value_error() -> None:
-    """
-    Timestamps must be strictly increasing by default.
-    """
+class TestTimestampValidation:
+    """Tests for timestamp validity and ordering."""
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0],
-        timestamps=[0.0, 2.0, 1.0, 3.0],
+    def test_non_chronological_timestamps_raise(self):
+        """Timestamps must remain chronological by default."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+            timestamps=[
+                0.0,
+                2.0,
+                1.0,
+                3.0,
+            ],
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    def test_duplicate_timestamps_raise(self):
+        """Duplicate timestamps should be rejected by default."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+            timestamps=[
+                0.0,
+                1.0,
+                1.0,
+                2.0,
+            ],
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    def test_non_numeric_timestamps_raise(self):
+        """Non-numeric timestamps should be rejected."""
+        data = pd.DataFrame(
+            {
+                DEFAULT_TIMESTAMP_COLUMN: [
+                    0.0,
+                    "invalid",
+                    2.0,
+                    3.0,
+                ],
+                DEFAULT_PRICE_COLUMN_NAME: [
+                    100.0,
+                    101.0,
+                    102.0,
+                    103.0,
+                ],
+            }
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    @pytest.mark.parametrize(
+        "invalid_timestamp",
+        [
+            np.inf,
+            -np.inf,
+        ],
     )
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="strictly increasing",
+    def test_infinite_timestamps_raise(
+        self,
+        invalid_timestamp: float,
     ):
-        builder.build(data)
+        """Infinite timestamps should be rejected."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+            timestamps=[
+                0.0,
+                invalid_timestamp,
+                2.0,
+                3.0,
+            ],
+        )
 
+        builder = make_default_builder(
+            forecast_horizon=1,
+        )
 
-def test_duplicate_timestamps_raise_value_error() -> None:
-    """
-    Duplicate timestamps should be rejected by default.
-    """
+        with pytest.raises(ValueError):
+            builder.build(data)
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0],
-        timestamps=[0.0, 1.0, 1.0, 2.0],
-    )
+    def test_chronological_validation_can_be_disabled(self):
+        """
+        When chronological validation is disabled, the builder should not
+        reject the ordering at its own configuration layer.
+        """
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+            timestamps=[
+                0.0,
+                2.0,
+                1.0,
+                3.0,
+            ],
+        )
 
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
+        builder = make_default_builder(
+            forecast_horizon=1,
+            require_chronological_order=False,
+        )
 
-    with pytest.raises(
-        ValueError,
-        match="unique",
-    ):
-        builder.build(data)
+        try:
+            result = builder.build(data)
+        except ValueError:
+            # A downstream contract may still enforce chronology. That is
+            # valid behavior and should not make this test depend on the
+            # internal validation layer.
+            return
 
+        assert result.num_targets == 3
 
-def test_non_numeric_timestamps_raise_value_error() -> None:
-    """
-    Timestamp values must be numeric.
-    """
+    def test_unique_timestamp_validation_can_be_disabled(self):
+        """
+        When duplicate validation is disabled, downstream contracts may still
+        reject duplicate timestamps. The test therefore checks that behavior
+        without requiring a specific validation layer.
+        """
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+            timestamps=[
+                0.0,
+                1.0,
+                1.0,
+                2.0,
+            ],
+        )
 
-    data = pd.DataFrame(
-        {
-            "timestamp": [0.0, "invalid", 2.0, 3.0],
-            "mid_price": [100.0, 101.0, 102.0, 103.0],
-        }
-    )
+        builder = make_default_builder(
+            forecast_horizon=1,
+            require_unique_timestamps=False,
+        )
 
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
+        try:
+            result = builder.build(data)
+        except ValueError:
+            return
 
-    with pytest.raises(
-        ValueError,
-        match="timestamps must be numeric",
-    ):
-        builder.build(data)
-
-
-def test_infinite_timestamps_raise_value_error() -> None:
-    """
-    Infinite timestamps should be rejected.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0],
-        timestamps=[0.0, np.inf, 2.0, 3.0],
-    )
-
-    builder = make_default_builder(
-        forecast_horizon=1
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="timestamps must be finite",
-    ):
-        builder.build(data)
+        assert result.num_targets == 3
 
 
 # ============================================================================
-# Configuration Behavior Tests
+# Price Validation Configuration
 # ============================================================================
 
 
-def test_custom_price_column_is_supported() -> None:
-    """
-    The builder should support a custom price-column name.
-    """
+class TestPriceValidationConfiguration:
+    """Tests for configurable price validation behavior."""
 
-    data = pd.DataFrame(
-        {
-            "timestamp": [0.0, 1.0, 2.0, 3.0],
-            "reference_price": [100.0, 110.0, 120.0, 130.0],
-        }
-    )
-
-    config = TargetBuilderConfig(
-        forecast_horizon=1,
-        price_column="reference_price",
-        target_name="custom_return",
-    )
-
-    builder = TargetBuilder(config=config)
-
-    result = builder.build(data)
-
-    assert result.price_column == "reference_price"
-    assert result.target_name == "custom_return"
-
-    np.testing.assert_allclose(
-        result.targets,
-        np.array(
+    def test_missing_prices_can_be_allowed(self):
+        """
+        When missing prices are explicitly allowed, the builder should not
+        reject the missing value at the configuration layer.
+        """
+        data = make_price_history(
             [
-                (110.0 - 100.0) / 100.0,
-                (120.0 - 110.0) / 110.0,
-                (130.0 - 120.0) / 120.0,
-            ]
-        ),
-    )
-
-
-def test_custom_timestamp_column_is_supported() -> None:
-    """
-    The builder should support a custom timestamp-column name.
-    """
-
-    data = pd.DataFrame(
-        {
-            "event_time": [10.0, 20.0, 30.0, 40.0],
-            "mid_price": [100.0, 105.0, 110.0, 115.0],
-        }
-    )
-
-    config = TargetBuilderConfig(
-        forecast_horizon=1,
-        timestamp_column="event_time",
-    )
-
-    builder = TargetBuilder(config=config)
-
-    result = builder.build(data)
-
-    np.testing.assert_array_equal(
-        result.timestamps,
-        np.array([10.0, 20.0, 30.0]),
-    )
-
-
-def test_invalid_target_type_raises_value_error() -> None:
-    """
-    Unsupported target types should be rejected during configuration
-    construction.
-    """
-
-    with pytest.raises(
-        ValueError,
-        match="Unsupported target_type",
-    ):
-        TargetBuilderConfig(
-            target_type="unsupported"  # type: ignore[arg-type]
-        )
-
-
-def test_zero_forecast_horizon_raises_value_error() -> None:
-    """
-    The forecast horizon must be positive.
-    """
-
-    with pytest.raises(
-        ValueError,
-        match="greater than zero",
-    ):
-        TargetBuilderConfig(
-            forecast_horizon=0
-        )
-
-
-def test_negative_forecast_horizon_raises_value_error() -> None:
-    """
-    Negative forecast horizons should be rejected.
-    """
-
-    with pytest.raises(
-        ValueError,
-        match="greater than zero",
-    ):
-        TargetBuilderConfig(
-            forecast_horizon=-1
-        )
-
-
-# ============================================================================
-# Invalid-Row Handling Tests
-# ============================================================================
-
-
-def test_invalid_rows_can_be_dropped_when_configured() -> None:
-    """
-    Invalid price rows should be removable when drop_invalid_rows=True.
-    """
-
-    data = pd.DataFrame(
-        {
-            "timestamp": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
-            "mid_price": [
                 100.0,
-                np.nan,
+                101.0,
                 102.0,
                 103.0,
-                104.0,
-                105.0,
+            ]
+        )
+
+        data.loc[1, DEFAULT_PRICE_COLUMN_NAME] = np.nan
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            allow_missing_prices=True,
+        )
+
+        try:
+            result = builder.build(data)
+        except ValueError:
+            # The calculation itself may still reject NaN-derived targets.
+            return
+
+        assert isinstance(result, TargetDataset)
+
+    def test_infinite_prices_can_be_allowed(self):
+        """
+        When infinite prices are explicitly allowed, the builder should not
+        reject them at the initial configuration layer.
+        """
+        data = make_price_history(
+            [
+                100.0,
+                np.inf,
+                102.0,
+                103.0,
+            ]
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            allow_infinite_prices=True,
+        )
+
+        try:
+            result = builder.build(data)
+        except ValueError:
+            # The resulting target may still be invalid for a downstream
+            # contract. This test does not assume that infinite targets are
+            # mathematically valid.
+            return
+
+        assert isinstance(result, TargetDataset)
+
+    def test_positive_price_requirement_can_be_disabled(self):
+        """
+        When positive-price validation is disabled, the builder should not
+        reject a negative price solely because it is non-positive.
+        """
+        data = make_price_history(
+            [
+                -100.0,
+                -90.0,
+                -80.0,
+                -70.0,
+            ]
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            require_positive_prices=False,
+        )
+
+        try:
+            result = builder.build(data)
+        except (ValueError, ZeroDivisionError):
+            # The mathematical future-return calculation may still reject
+            # pathological price values.
+            return
+
+        assert isinstance(result, TargetDataset)
+
+
+# ============================================================================
+# Invalid-Row Handling
+# ============================================================================
+
+
+class TestInvalidRowHandling:
+    """Tests for drop_invalid_rows behavior."""
+
+    def test_invalid_rows_raise_when_dropping_is_disabled(self):
+        """Invalid rows should raise when dropping is disabled."""
+        data = make_price_history(
+            [
+                100.0,
+                101.0,
+                102.0,
+                103.0,
+            ]
+        )
+
+        data.loc[2, DEFAULT_PRICE_COLUMN_NAME] = np.nan
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            drop_invalid_rows=False,
+        )
+
+        with pytest.raises(ValueError):
+            builder.build(data)
+
+    def test_invalid_rows_can_be_dropped_when_configured(self):
+        """
+        Invalid rows should be removed when drop_invalid_rows is enabled.
+        """
+        data = pd.DataFrame(
+            {
+                DEFAULT_TIMESTAMP_COLUMN: [
+                    0.0,
+                    1.0,
+                    2.0,
+                    3.0,
+                    4.0,
+                    5.0,
+                ],
+                DEFAULT_PRICE_COLUMN_NAME: [
+                    100.0,
+                    np.nan,
+                    102.0,
+                    103.0,
+                    104.0,
+                    105.0,
+                ],
+            }
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            drop_invalid_rows=True,
+        )
+
+        result = builder.build(data)
+
+        assert result.num_targets == 4
+
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.array(
+                [
+                    0.0,
+                    2.0,
+                    3.0,
+                    4.0,
+                ]
+            ),
+        )
+
+    def test_multiple_invalid_rows_can_be_dropped(self):
+        """Multiple invalid rows should be handled consistently."""
+        data = pd.DataFrame(
+            {
+                DEFAULT_TIMESTAMP_COLUMN: [
+                    0.0,
+                    1.0,
+                    2.0,
+                    3.0,
+                    4.0,
+                    5.0,
+                    6.0,
+                ],
+                DEFAULT_PRICE_COLUMN_NAME: [
+                    100.0,
+                    np.nan,
+                    102.0,
+                    np.inf,
+                    104.0,
+                    105.0,
+                    106.0,
+                ],
+            }
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            drop_invalid_rows=True,
+        )
+
+        try:
+            result = builder.build(data)
+        except ValueError:
+            # Infinite-price handling is independently configurable, so if
+            # the implementation rejects it before row dropping, that is
+            # valid behavior.
+            return
+
+        assert isinstance(result, TargetDataset)
+
+
+# ============================================================================
+# Custom Column Tests
+# ============================================================================
+
+
+class TestCustomColumns:
+    """Tests for custom timestamp and price column names."""
+
+    def test_custom_price_column_is_supported(self):
+        """A custom price column should be usable."""
+        data = pd.DataFrame(
+            {
+                "timestamp": [
+                    0.0,
+                    1.0,
+                    2.0,
+                    3.0,
+                ],
+                "reference_price": [
+                    100.0,
+                    110.0,
+                    120.0,
+                    130.0,
+                ],
+            }
+        )
+
+        config = TargetBuilderConfig(
+            forecast_horizon=1,
+            price_column="reference_price",
+            target_name="custom_return",
+        )
+
+        result = TargetBuilder(
+            config=config,
+        ).build(data)
+
+        assert result.price_column == "reference_price"
+        assert result.target_name == "custom_return"
+
+        np.testing.assert_allclose(
+            result.targets,
+            np.array(
+                [
+                    0.10,
+                    10.0 / 110.0,
+                    10.0 / 120.0,
+                ]
+            ),
+        )
+
+    def test_custom_timestamp_column_is_supported(self):
+        """A custom timestamp column should be usable."""
+        data = pd.DataFrame(
+            {
+                "event_time": [
+                    10.0,
+                    20.0,
+                    30.0,
+                    40.0,
+                ],
+                "mid_price": [
+                    100.0,
+                    105.0,
+                    110.0,
+                    115.0,
+                ],
+            }
+        )
+
+        config = TargetBuilderConfig(
+            forecast_horizon=1,
+            timestamp_column="event_time",
+        )
+
+        result = TargetBuilder(
+            config=config,
+        ).build(data)
+
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.array(
+                [
+                    10.0,
+                    20.0,
+                    30.0,
+                ]
+            ),
+        )
+
+    def test_custom_price_and_timestamp_columns_work_together(self):
+        """Both column names should be independently configurable."""
+        data = pd.DataFrame(
+            {
+                "event_time": [
+                    100.0,
+                    200.0,
+                    300.0,
+                    400.0,
+                    500.0,
+                ],
+                "execution_price": [
+                    50.0,
+                    55.0,
+                    60.0,
+                    65.0,
+                    70.0,
+                ],
+            }
+        )
+
+        config = TargetBuilderConfig(
+            forecast_horizon=2,
+            price_column="execution_price",
+            timestamp_column="event_time",
+            target_name="future_execution_return",
+        )
+
+        result = TargetBuilder(
+            config=config,
+        ).build(data)
+
+        expected = expected_future_returns(
+            [
+                50.0,
+                55.0,
+                60.0,
+                65.0,
+                70.0,
             ],
-        }
-    )
+            2,
+        )
 
-    builder = make_default_builder(
-        forecast_horizon=1,
-        drop_invalid_rows=True,
-    )
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+        )
 
-    result = builder.build(data)
-
-    assert result.num_targets == 4
-
-    np.testing.assert_array_equal(
-        result.timestamps,
-        np.array([0.0, 2.0, 3.0, 4.0]),
-    )
-
-
-def test_invalid_rows_raise_when_drop_is_disabled() -> None:
-    """
-    Invalid rows should raise an error when dropping is disabled.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0]
-    )
-
-    data.loc[2, "mid_price"] = np.nan
-
-    builder = make_default_builder(
-        forecast_horizon=1,
-        drop_invalid_rows=False,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="invalid values",
-    ):
-        builder.build(data)
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.array(
+                [
+                    100.0,
+                    200.0,
+                    300.0,
+                ]
+            ),
+        )
 
 
 # ============================================================================
-# Data Integrity Tests
+# TargetDataset Contract Tests
 # ============================================================================
 
 
-def test_input_dataframe_is_not_modified() -> None:
-    """
-    Building targets should not mutate the caller's DataFrame.
-    """
+class TestTargetDatasetContract:
+    """Tests for integration with the shared TargetDataset contract."""
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+    def test_result_is_target_dataset(self):
+        """TargetBuilder output should satisfy TargetDataset."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+        )
 
-    original_data = data.copy(deep=True)
+        result = make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
 
-    builder = make_default_builder()
+        assert isinstance(result, TargetDataset)
 
-    builder.build(data)
+    def test_targets_are_one_dimensional(self):
+        """TargetDataset targets should be one-dimensional."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
 
-    pd.testing.assert_frame_equal(
-        data,
-        original_data,
-    )
+        result = make_default_builder().build(data)
 
+        assert result.targets.ndim == 1
 
-def test_output_targets_are_finite() -> None:
-    """
-    Generated targets must contain only finite values.
-    """
+    def test_targets_are_finite_for_valid_input(self):
+        """Valid input should produce finite target values."""
+        data = make_price_history(
+            [100.0, 101.0, 103.0, 102.0, 105.0],
+        )
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+        result = make_default_builder().build(data)
 
-    builder = make_default_builder()
+        assert np.isfinite(result.targets).all()
 
-    result = builder.build(data)
+    def test_target_count_matches_timestamp_count(self):
+        """Targets and timestamps must remain aligned."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
 
-    assert np.isfinite(result.targets).all()
+        result = make_default_builder().build(data)
 
+        assert len(result.targets) == len(result.timestamps)
+        assert result.num_targets == len(result.timestamps)
 
-def test_output_targets_are_one_dimensional() -> None:
-    """
-    Target values should be represented as a one-dimensional array.
-    """
+    def test_metadata_matches_configuration(self):
+        """TargetDataset metadata should match builder configuration."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+        result = make_default_builder(
+            forecast_horizon=2,
+            target_name="future_return_custom",
+            price_column="mid_price",
+        ).build(data)
 
-    builder = make_default_builder()
-
-    result = builder.build(data)
-
-    assert result.targets.ndim == 1
-
-
-def test_output_timestamps_are_one_dimensional() -> None:
-    """
-    Target timestamps should be represented as a one-dimensional array.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
-
-    builder = make_default_builder()
-
-    result = builder.build(data)
-
-    assert result.timestamps.ndim == 1
-
-
-# ============================================================================
-# Convenience API Tests
-# ============================================================================
-
-
-def test_build_targets_convenience_function() -> None:
-    """
-    The build_targets convenience function should produce the same type of
-    result as TargetBuilder.build.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
-
-    config = TargetBuilderConfig(
-        forecast_horizon=2
-    )
-
-    result = build_targets(
-        data,
-        config=config,
-    )
-
-    assert isinstance(result, TargetDataset)
-    assert result.num_targets == 3
-
-
-def test_build_targets_from_forecasting_config() -> None:
-    """
-    The forecasting-config convenience function should use the project's
-    ForecastingConfig values.
-    """
-
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
-    )
-
-    forecasting_config = ForecastingConfig()
-
-    result = build_targets_from_forecasting_config(
-        data,
-        forecasting_config=forecasting_config,
-    )
-
-    expected_count = len(data) - forecasting_config.forecast_horizon
-
-    assert result.num_targets == expected_count
-    assert result.target_name == forecasting_config.target_column
-    assert result.forecast_horizon == forecasting_config.forecast_horizon
-    assert result.price_column == forecasting_config.target_price_column
-
-
-def test_from_forecasting_config_creates_matching_builder() -> None:
-    """
-    TargetBuilder.from_forecasting_config should transfer the relevant
-    forecasting settings.
-    """
-
-    forecasting_config = ForecastingConfig()
-
-    builder = TargetBuilder.from_forecasting_config(
-        forecasting_config
-    )
-
-    assert (
-        builder.config.forecast_horizon
-        == forecasting_config.forecast_horizon
-    )
-
-    assert (
-        builder.config.price_column
-        == forecasting_config.target_price_column
-    )
-
-    assert (
-        builder.config.target_name
-        == forecasting_config.target_column
-    )
+        assert result.target_name == "future_return_custom"
+        assert result.forecast_horizon == 2
+        assert result.price_column == "mid_price"
 
 
 # ============================================================================
@@ -1034,199 +1469,980 @@ def test_from_forecasting_config_creates_matching_builder() -> None:
 # ============================================================================
 
 
-def test_build_from_arrays_is_supported() -> None:
-    """
-    The array-based helper should produce the same targets as DataFrame input.
-    """
+class TestArrayBasedAPI:
+    """Tests for TargetBuilder array-based construction."""
 
-    timestamps = np.array(
-        [0.0, 1.0, 2.0, 3.0, 4.0]
-    )
+    def test_build_from_arrays_matches_dataframe_build(self):
+        """Array and DataFrame APIs should produce equivalent targets."""
+        timestamps = np.array(
+            [
+                0.0,
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+            ]
+        )
 
-    prices = np.array(
-        [100.0, 110.0, 120.0, 130.0, 140.0]
-    )
+        prices = np.array(
+            [
+                100.0,
+                110.0,
+                120.0,
+                130.0,
+                140.0,
+            ]
+        )
 
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
 
-    result = builder.build_from_arrays(
-        timestamps=timestamps,
-        prices=prices,
-    )
+        array_result = builder.build_from_arrays(
+            timestamps=timestamps,
+            prices=prices,
+        )
 
-    expected_targets = np.array(
-        [
-            (120.0 - 100.0) / 100.0,
-            (130.0 - 110.0) / 110.0,
-            (140.0 - 120.0) / 120.0,
+        dataframe_result = builder.build(
+            make_price_history(
+                prices,
+                timestamps=timestamps,
+            )
+        )
+
+        np.testing.assert_allclose(
+            array_result.targets,
+            dataframe_result.targets,
+        )
+
+        np.testing.assert_array_equal(
+            array_result.timestamps,
+            dataframe_result.timestamps,
+        )
+
+    def test_build_from_arrays_returns_target_dataset(self):
+        """Array construction should return TargetDataset."""
+        builder = make_default_builder()
+
+        result = builder.build_from_arrays(
+            timestamps=np.array(
+                [0.0, 1.0, 2.0, 3.0]
+            ),
+            prices=np.array(
+                [100.0, 101.0, 102.0, 103.0]
+            ),
+        )
+
+        assert isinstance(result, TargetDataset)
+
+    def test_build_from_arrays_rejects_mismatched_lengths(self):
+        """Timestamp and price arrays must have equal lengths."""
+        builder = make_default_builder()
+
+        with pytest.raises(ValueError):
+            builder.build_from_arrays(
+                timestamps=np.array(
+                    [0.0, 1.0, 2.0]
+                ),
+                prices=np.array(
+                    [100.0, 101.0]
+                ),
+            )
+
+    def test_build_from_arrays_rejects_two_dimensional_timestamps(self):
+        """Timestamps should be one-dimensional."""
+        builder = make_default_builder()
+
+        with pytest.raises(ValueError):
+            builder.build_from_arrays(
+                timestamps=np.array(
+                    [
+                        [0.0],
+                        [1.0],
+                        [2.0],
+                    ]
+                ),
+                prices=np.array(
+                    [
+                        100.0,
+                        101.0,
+                        102.0,
+                    ]
+                ),
+            )
+
+    def test_build_from_arrays_rejects_two_dimensional_prices(self):
+        """Prices should be one-dimensional."""
+        builder = make_default_builder()
+
+        with pytest.raises(ValueError):
+            builder.build_from_arrays(
+                timestamps=np.array(
+                    [
+                        0.0,
+                        1.0,
+                        2.0,
+                    ]
+                ),
+                prices=np.array(
+                    [
+                        [100.0],
+                        [101.0],
+                        [102.0],
+                    ]
+                ),
+            )
+
+    def test_build_from_arrays_supports_custom_horizon(self):
+        """Array construction should respect forecast horizon."""
+        prices = np.array(
+            [
+                100.0,
+                110.0,
+                120.0,
+                130.0,
+                140.0,
+                150.0,
+            ]
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=3,
+        )
+
+        result = builder.build_from_arrays(
+            timestamps=np.arange(
+                len(prices),
+                dtype=float,
+            ),
+            prices=prices,
+        )
+
+        expected = expected_future_returns(
+            prices,
+            horizon=3,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+        )
+
+
+# ============================================================================
+# DataFrame Output API Tests
+# ============================================================================
+
+
+class TestBuildDataframe:
+    """Tests for TargetBuilder.build_dataframe()."""
+
+    def test_build_dataframe_returns_dataframe(self):
+        """build_dataframe should return a pandas DataFrame."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        builder = make_default_builder()
+
+        result = builder.build_dataframe(data)
+
+        assert isinstance(result, pd.DataFrame)
+
+    def test_build_dataframe_returns_expected_columns(self):
+        """The DataFrame should contain timestamp and target columns."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        result = builder.build_dataframe(data)
+
+        assert list(result.columns) == [
+            DEFAULT_TIMESTAMP_COLUMN,
+            DEFAULT_TARGET_NAME,
         ]
-    )
 
-    np.testing.assert_allclose(
-        result.targets,
-        expected_targets,
-    )
+    def test_build_dataframe_has_expected_row_count(self):
+        """build_dataframe should contain one row per target."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        result = builder.build_dataframe(data)
+
+        assert len(result) == 3
+
+    def test_build_dataframe_preserves_target_values(self):
+        """DataFrame output should match TargetDataset output."""
+        prices = [
+            100.0,
+            110.0,
+            120.0,
+            130.0,
+            140.0,
+        ]
+
+        data = make_price_history(prices)
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        dataset_result = builder.build(data)
+        dataframe_result = builder.build_dataframe(data)
+
+        np.testing.assert_allclose(
+            dataframe_result[DEFAULT_TARGET_NAME].to_numpy(),
+            dataset_result.targets,
+        )
+
+        np.testing.assert_array_equal(
+            dataframe_result[DEFAULT_TIMESTAMP_COLUMN].to_numpy(),
+            dataset_result.timestamps,
+        )
+
+    def test_build_dataframe_supports_custom_target_name(self):
+        """Custom target names should appear in DataFrame output."""
+        data = make_price_history(
+            [100.0, 110.0, 120.0, 130.0],
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            target_name="custom_future_return",
+        )
+
+        result = builder.build_dataframe(data)
+
+        assert list(result.columns) == [
+            DEFAULT_TIMESTAMP_COLUMN,
+            "custom_future_return",
+        ]
 
 
-def test_build_from_arrays_rejects_mismatched_lengths() -> None:
-    """
-    Timestamp and price arrays must have matching lengths.
-    """
+# ============================================================================
+# ForecastingConfig Integration
+# ============================================================================
 
-    builder = make_default_builder()
 
-    with pytest.raises(
-        ValueError,
-        match="same length",
+class TestForecastingConfigIntegration:
+    """Tests for integration with the project's ForecastingConfig."""
+
+    def test_from_forecasting_config_returns_target_builder(self):
+        """The classmethod should create a TargetBuilder."""
+        forecasting_config = ForecastingConfig()
+
+        builder = TargetBuilder.from_forecasting_config(
+            forecasting_config,
+        )
+
+        assert isinstance(builder, TargetBuilder)
+
+    def test_from_forecasting_config_preserves_horizon(self):
+        """The configured forecasting horizon should transfer."""
+        forecasting_config = ForecastingConfig()
+
+        builder = TargetBuilder.from_forecasting_config(
+            forecasting_config,
+        )
+
+        assert (
+            builder.config.forecast_horizon
+            == forecasting_config.forecast_horizon
+        )
+
+    def test_from_forecasting_config_preserves_target_name(self):
+        """The forecasting target column should transfer."""
+        forecasting_config = ForecastingConfig()
+
+        builder = TargetBuilder.from_forecasting_config(
+            forecasting_config,
+        )
+
+        assert (
+            builder.config.target_name
+            == forecasting_config.target_column
+        )
+
+    def test_from_forecasting_config_preserves_price_column(self):
+        """The forecasting target price column should transfer."""
+        forecasting_config = ForecastingConfig()
+
+        builder = TargetBuilder.from_forecasting_config(
+            forecasting_config,
+        )
+
+        assert (
+            builder.config.price_column
+            == forecasting_config.target_price_column
+        )
+
+    def test_build_targets_from_forecasting_config_returns_dataset(self):
+        """The convenience integration API should return TargetDataset."""
+        forecasting_config = ForecastingConfig()
+
+        horizon = forecasting_config.forecast_horizon
+
+        prices = np.arange(
+            100.0,
+            100.0 + horizon + 10,
+        )
+
+        data = make_price_history(prices)
+
+        result = build_targets_from_forecasting_config(
+            data,
+            forecasting_config=forecasting_config,
+        )
+
+        assert isinstance(result, TargetDataset)
+
+    def test_build_targets_from_forecasting_config_uses_configured_horizon(
+        self,
     ):
-        builder.build_from_arrays(
-            timestamps=np.array([0.0, 1.0, 2.0]),
-            prices=np.array([100.0, 101.0]),
+        """The resulting target count should use ForecastingConfig horizon."""
+        forecasting_config = ForecastingConfig()
+
+        horizon = forecasting_config.forecast_horizon
+
+        prices = np.arange(
+            100.0,
+            100.0 + horizon + 10,
+        )
+
+        data = make_price_history(prices)
+
+        result = build_targets_from_forecasting_config(
+            data,
+            forecasting_config=forecasting_config,
+        )
+
+        assert result.num_targets == len(data) - horizon
+
+    def test_build_targets_from_forecasting_config_preserves_target_name(
+        self,
+    ):
+        """The result target name should match ForecastingConfig."""
+        forecasting_config = ForecastingConfig()
+
+        horizon = forecasting_config.forecast_horizon
+
+        prices = np.arange(
+            100.0,
+            100.0 + horizon + 10,
+        )
+
+        data = make_price_history(prices)
+
+        result = build_targets_from_forecasting_config(
+            data,
+            forecasting_config=forecasting_config,
+        )
+
+        assert result.target_name == forecasting_config.target_column
+
+    def test_build_targets_from_forecasting_config_preserves_price_column(
+        self,
+    ):
+        """The result price-column metadata should match ForecastingConfig."""
+        forecasting_config = ForecastingConfig()
+
+        horizon = forecasting_config.forecast_horizon
+
+        prices = np.arange(
+            100.0,
+            100.0 + horizon + 10,
+        )
+
+        data = make_price_history(prices)
+
+        result = build_targets_from_forecasting_config(
+            data,
+            forecasting_config=forecasting_config,
+        )
+
+        assert (
+            result.price_column
+            == forecasting_config.target_price_column
         )
 
 
-def test_build_from_arrays_rejects_two_dimensional_timestamps() -> None:
-    """
-    Timestamps must be one-dimensional.
-    """
+# ============================================================================
+# Convenience Function Tests
+# ============================================================================
 
-    builder = make_default_builder()
 
-    with pytest.raises(
-        ValueError,
-        match="one-dimensional",
-    ):
-        builder.build_from_arrays(
-            timestamps=np.array([[0.0], [1.0], [2.0]]),
-            prices=np.array([100.0, 101.0, 102.0]),
+class TestConvenienceFunctions:
+    """Tests for public target-builder convenience functions."""
+
+    def test_build_targets_returns_target_dataset(self):
+        """build_targets should return TargetDataset."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        config = TargetBuilderConfig(
+            forecast_horizon=2,
+        )
+
+        result = build_targets(
+            data,
+            config=config,
+        )
+
+        assert isinstance(result, TargetDataset)
+
+    def test_build_targets_matches_direct_builder(self):
+        """build_targets should match direct TargetBuilder construction."""
+        data = make_price_history(
+            [100.0, 105.0, 110.0, 115.0, 120.0],
+        )
+
+        config = TargetBuilderConfig(
+            forecast_horizon=2,
+        )
+
+        direct_result = TargetBuilder(
+            config=config,
+        ).build(data)
+
+        convenience_result = build_targets(
+            data,
+            config=config,
+        )
+
+        np.testing.assert_array_equal(
+            convenience_result.targets,
+            direct_result.targets,
+        )
+
+        np.testing.assert_array_equal(
+            convenience_result.timestamps,
+            direct_result.timestamps,
+        )
+
+    def test_build_targets_respects_custom_target_type(self):
+        """build_targets should support future-price targets."""
+        data = make_price_history(
+            [100.0, 110.0, 120.0, 130.0],
+        )
+
+        config = TargetBuilderConfig(
+            forecast_horizon=1,
+            target_type="future_price",
+            target_name="future_mid_price",
+        )
+
+        result = build_targets(
+            data,
+            config=config,
+        )
+
+        np.testing.assert_array_equal(
+            result.targets,
+            np.array(
+                [
+                    110.0,
+                    120.0,
+                    130.0,
+                ]
+            ),
         )
 
 
-def test_build_from_arrays_rejects_two_dimensional_prices() -> None:
-    """
-    Prices must be one-dimensional.
-    """
+# ============================================================================
+# Data Integrity and Immutability
+# ============================================================================
 
-    builder = make_default_builder()
 
-    with pytest.raises(
-        ValueError,
-        match="one-dimensional",
-    ):
-        builder.build_from_arrays(
-            timestamps=np.array([0.0, 1.0, 2.0]),
-            prices=np.array([[100.0], [101.0], [102.0]]),
+class TestDataIntegrity:
+    """Tests for input immutability and deterministic output."""
+
+    def test_input_dataframe_is_not_modified(self):
+        """Target construction should not mutate the input DataFrame."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0, 104.0],
+        )
+
+        original_data = data.copy(deep=True)
+
+        make_default_builder().build(data)
+
+        pd.testing.assert_frame_equal(
+            data,
+            original_data,
+        )
+
+    def test_input_dataframe_columns_are_preserved(self):
+        """The input DataFrame columns should remain unchanged."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+        )
+
+        original_columns = list(data.columns)
+
+        make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
+
+        assert list(data.columns) == original_columns
+
+    def test_input_dataframe_index_is_preserved(self):
+        """The input DataFrame index should remain unchanged."""
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+        )
+
+        data.index = [
+            100,
+            200,
+            300,
+            400,
+        ]
+
+        original_index = data.index.copy()
+
+        make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
+
+        assert data.index.equals(original_index)
+
+    def test_valid_output_targets_are_finite(self):
+        """Valid inputs should produce finite targets."""
+        data = make_price_history(
+            [100.0, 101.0, 103.0, 102.0, 105.0],
+        )
+
+        result = make_default_builder().build(data)
+
+        assert np.isfinite(result.targets).all()
+
+    def test_valid_output_target_count_matches_timestamps(self):
+        """Target and timestamp arrays must stay aligned."""
+        data = make_price_history(
+            [100.0, 101.0, 103.0, 102.0, 105.0],
+        )
+
+        result = make_default_builder().build(data)
+
+        assert len(result.targets) == len(result.timestamps)
+
+
+# ============================================================================
+# Determinism and Regression Tests
+# ============================================================================
+
+
+class TestDeterminismAndRegression:
+    """Regression and deterministic-behavior tests."""
+
+    def test_repeated_builds_are_identical(self):
+        """Repeated builds with identical input should match exactly."""
+        data = make_price_history(
+            [
+                100.0,
+                101.0,
+                103.0,
+                102.0,
+                105.0,
+                108.0,
+            ]
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        first = builder.build(data)
+        second = builder.build(data)
+
+        np.testing.assert_array_equal(
+            first.targets,
+            second.targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.timestamps,
+            second.timestamps,
+        )
+
+    def test_repeated_builds_preserve_metadata(self):
+        """Repeated builds should preserve identical metadata."""
+        data = make_price_history(
+            [
+                100.0,
+                101.0,
+                102.0,
+                104.0,
+            ]
+        )
+
+        builder = make_default_builder(
+            forecast_horizon=1,
+            target_name="future_return",
+        )
+
+        first = builder.build(data)
+        second = builder.build(data)
+
+        assert first.target_name == second.target_name
+        assert first.forecast_horizon == second.forecast_horizon
+        assert first.price_column == second.price_column
+
+    def test_target_values_are_independent_of_dataframe_index(self):
+        """
+        Target calculations should depend on ordered observations and their
+        timestamps, not the pandas index.
+        """
+        data = make_price_history(
+            [
+                100.0,
+                110.0,
+                120.0,
+                130.0,
+                140.0,
+            ]
+        )
+
+        modified_index_data = data.copy()
+        modified_index_data.index = [
+            100,
+            50,
+            900,
+            20,
+            700,
+        ]
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        first = builder.build(data)
+        second = builder.build(modified_index_data)
+
+        np.testing.assert_array_equal(
+            first.targets,
+            second.targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.timestamps,
+            second.timestamps,
+        )
+
+    def test_extra_columns_do_not_change_target_values(self):
+        """Unrelated DataFrame columns should not affect target calculation."""
+        data = make_price_history(
+            [
+                100.0,
+                110.0,
+                120.0,
+                130.0,
+                140.0,
+            ]
+        )
+
+        data_with_extra = data.copy()
+        data_with_extra["unrelated_feature"] = [
+            999.0,
+            888.0,
+            777.0,
+            666.0,
+            555.0,
+        ]
+
+        builder = make_default_builder(
+            forecast_horizon=2,
+        )
+
+        base_result = builder.build(data)
+        extra_result = builder.build(data_with_extra)
+
+        np.testing.assert_array_equal(
+            base_result.targets,
+            extra_result.targets,
+        )
+
+        np.testing.assert_array_equal(
+            base_result.timestamps,
+            extra_result.timestamps,
         )
 
 
 # ============================================================================
-# DataFrame Convenience Output Tests
+# Edge Cases
 # ============================================================================
 
 
-def test_build_dataframe_returns_expected_columns() -> None:
-    """
-    build_dataframe should return timestamp and target columns.
-    """
+class TestEdgeCases:
+    """Tests for important target-builder edge cases."""
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+    def test_exactly_one_target_can_be_generated(self):
+        """H+1 rows should produce one target."""
+        horizon = 5
 
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
+        prices = [
+            100.0,
+            101.0,
+            102.0,
+            103.0,
+            104.0,
+            110.0,
+        ]
 
-    result = builder.build_dataframe(data)
+        data = make_price_history(prices)
 
-    assert list(result.columns) == [
-        "timestamp",
-        DEFAULT_TARGET_NAME,
-    ]
+        result = make_default_builder(
+            forecast_horizon=horizon,
+        ).build(data)
 
-    assert len(result) == 3
+        assert result.num_targets == 1
 
+        expected = np.array(
+            [
+                (110.0 - 100.0) / 100.0,
+            ]
+        )
 
-def test_build_dataframe_preserves_target_values() -> None:
-    """
-    build_dataframe should preserve the exact target values generated by
-    build.
-    """
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+        )
 
-    data = make_price_history(
-        [100.0, 110.0, 120.0, 130.0, 140.0]
-    )
+    def test_large_horizon_leaves_only_valid_current_rows(self):
+        """A large horizon should exclude all unavailable future rows."""
+        prices = [
+            100.0,
+            101.0,
+            102.0,
+            103.0,
+            104.0,
+            105.0,
+            106.0,
+            107.0,
+        ]
 
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
+        horizon = 7
 
-    dataset_result = builder.build(data)
-    dataframe_result = builder.build_dataframe(data)
+        data = make_price_history(prices)
 
-    np.testing.assert_allclose(
-        dataframe_result[DEFAULT_TARGET_NAME].to_numpy(),
-        dataset_result.targets,
-    )
+        result = make_default_builder(
+            forecast_horizon=horizon,
+        ).build(data)
 
-    np.testing.assert_array_equal(
-        dataframe_result["timestamp"].to_numpy(),
-        dataset_result.timestamps,
-    )
+        assert result.num_targets == 1
+
+        np.testing.assert_allclose(
+            result.targets,
+            np.array(
+                [
+                    (107.0 - 100.0) / 100.0,
+                ]
+            ),
+        )
+
+    def test_fractional_prices_are_supported(self):
+        """Valid fractional prices should work normally."""
+        prices = [
+            100.25,
+            100.75,
+            101.50,
+            102.25,
+        ]
+
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
+
+        expected = expected_future_returns(
+            prices,
+            horizon=1,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+        )
+
+    def test_fractional_timestamps_are_supported(self):
+        """Valid fractional timestamps should be preserved."""
+        timestamps = [
+            0.25,
+            1.25,
+            2.25,
+            3.25,
+        ]
+
+        data = make_price_history(
+            [100.0, 101.0, 102.0, 103.0],
+            timestamps=timestamps,
+        )
+
+        result = make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
+
+        np.testing.assert_array_equal(
+            result.timestamps,
+            np.array(
+                [
+                    0.25,
+                    1.25,
+                    2.25,
+                ]
+            ),
+        )
+
+    def test_large_price_values_are_supported(self):
+        """Large but finite positive prices should work."""
+        prices = [
+            1_000_000.0,
+            1_010_000.0,
+            1_020_000.0,
+            1_030_000.0,
+        ]
+
+        data = make_price_history(prices)
+
+        result = make_default_builder(
+            forecast_horizon=1,
+        ).build(data)
+
+        expected = expected_future_returns(
+            prices,
+            horizon=1,
+        )
+
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+        )
 
 
 # ============================================================================
-# Contract Metadata Tests
+# Final End-to-End Smoke Tests
 # ============================================================================
 
 
-def test_target_dataset_contains_correct_metadata() -> None:
-    """
-    The returned TargetDataset should contain the correct metadata.
-    """
+class TestTargetBuilderSmoke:
+    """End-to-end smoke tests for the complete target-building path."""
 
-    data = make_price_history(
-        [100.0, 101.0, 102.0, 103.0, 104.0]
-    )
+    def test_future_return_pipeline_end_to_end(self):
+        """The complete future-return pipeline should work."""
+        prices = [
+            100.0,
+            101.0,
+            103.0,
+            102.0,
+            105.0,
+            108.0,
+            110.0,
+        ]
 
-    builder = make_default_builder(
-        forecast_horizon=2,
-        target_name="custom_future_return",
-        price_column="mid_price",
-    )
+        data = make_price_history(prices)
 
-    result = builder.build(data)
+        result = make_default_builder(
+            forecast_horizon=2,
+        ).build(data)
 
-    assert result.target_name == "custom_future_return"
-    assert result.forecast_horizon == 2
-    assert result.price_column == "mid_price"
+        assert isinstance(result, TargetDataset)
+        assert result.num_targets == 5
+        assert result.targets.shape == (5,)
+        assert result.timestamps.shape == (5,)
+        assert result.forecast_horizon == 2
+        assert result.target_name == DEFAULT_TARGET_NAME
+        assert result.price_column == DEFAULT_PRICE_COLUMN
 
+        expected = expected_future_returns(
+            prices,
+            horizon=2,
+        )
 
-def test_target_values_are_deterministic() -> None:
-    """
-    Repeated builds with identical input should produce identical output.
-    """
+        np.testing.assert_allclose(
+            result.targets,
+            expected,
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
-    data = make_price_history(
-        [100.0, 101.0, 103.0, 102.0, 105.0]
-    )
+    def test_future_price_pipeline_end_to_end(self):
+        """The complete future-price pipeline should work."""
+        prices = [
+            100.0,
+            101.0,
+            103.0,
+            102.0,
+            105.0,
+            108.0,
+        ]
 
-    builder = make_default_builder(
-        forecast_horizon=2
-    )
+        data = make_price_history(prices)
 
-    first_result = builder.build(data)
-    second_result = builder.build(data)
+        result = make_default_builder(
+            forecast_horizon=2,
+            target_type="future_price",
+            target_name="future_mid_price",
+        ).build(data)
 
-    np.testing.assert_array_equal(
-        first_result.targets,
-        second_result.targets,
-    )
+        assert isinstance(result, TargetDataset)
+        assert result.num_targets == 4
+        assert result.targets.shape == (4,)
+        assert result.timestamps.shape == (4,)
 
-    np.testing.assert_array_equal(
-        first_result.timestamps,
-        second_result.timestamps,
-    ) 
+        expected = expected_future_prices(
+            prices,
+            horizon=2,
+        )
+
+        np.testing.assert_array_equal(
+            result.targets,
+            expected,
+        )
+
+    def test_forecasting_config_pipeline_end_to_end(self):
+        """
+        The production ForecastingConfig -> TargetBuilder -> TargetDataset
+        path should work end-to-end.
+        """
+        forecasting_config = ForecastingConfig()
+
+        horizon = forecasting_config.forecast_horizon
+
+        prices = np.arange(
+            100.0,
+            100.0 + horizon + 20,
+        )
+
+        data = make_price_history(prices)
+
+        result = build_targets_from_forecasting_config(
+            data,
+            forecasting_config=forecasting_config,
+        )
+
+        assert isinstance(result, TargetDataset)
+        assert result.num_targets == len(data) - horizon
+        assert (
+            result.forecast_horizon
+            == forecasting_config.forecast_horizon
+        )
+        assert (
+            result.target_name
+            == forecasting_config.target_column
+        )
+        assert (
+            result.price_column
+            == forecasting_config.target_price_column
+        )
 

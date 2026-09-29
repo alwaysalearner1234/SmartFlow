@@ -1,54 +1,27 @@
 """
 tests/test_forecasting_dataset.py
 
-Comprehensive tests for the forecasting dataset alignment and model-facing
-dataset API.
+Comprehensive Phase 9 tests for the forecasting-dataset alignment layer.
 
-This test module verifies that:
-
-    SequenceDataset
-        +
-    TargetDataset
-        ->
-    ForecastingDataset
-
-is constructed correctly and without temporal leakage.
-
-The tests focus on:
-
-    - sequence/target timestamp alignment
-    - exact timestamp matching
-    - context-window preservation
-    - forecast-horizon preservation
-    - feature metadata preservation
-    - target metadata preservation
-    - chronological ordering
-    - duplicate timestamp protection
-    - unmatched timestamp handling
-    - dropping versus rejecting unaligned samples
-    - output shapes
-    - target alignment
-    - model-facing input shape
-    - model-facing target shape
-    - dtype handling
-    - copy behavior
-    - deterministic output
-    - convenience functions
-    - configuration behavior
-    - edge cases
-    - invalid inputs
+Responsibilities
+----------------
+- Validate exact timestamp-based sequence/target alignment.
+- Validate chronological and leakage-safe dataset construction.
+- Validate the ForecastingDataset model-facing API.
+- Validate the canonical NVIDIA forecasting data contract.
+- Validate configuration, dtype, copying, determinism, and edge cases.
+- Validate invalid-input rejection and output integrity.
 
 This module does not test:
 
-    - feature extraction
-    - target calculation itself
-    - chronological train/validation/test splitting
-    - normalization
-    - model architecture
-    - model training
-    - NVIDIA model inference
-
-Those responsibilities belong to their respective modules.
+- feature extraction
+- target calculation
+- chronological train/validation/test splitting
+- normalization
+- forecasting model architecture
+- model training
+- model inference
+- execution logic
 """
 
 from __future__ import annotations
@@ -66,9 +39,9 @@ from data.forecasting_dataset import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Test constants
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Constants
+# =============================================================================
 
 FEATURE_NAMES = (
     "mid_price_return",
@@ -91,11 +64,12 @@ CONTEXT_WINDOW = 20
 FORECAST_HORIZON = 5
 TARGET_NAME = "future_mid_price_return"
 PRICE_COLUMN = "mid_price"
+START_TIMESTAMP = 1000.0
 
 
-# ---------------------------------------------------------------------------
-# Helper factories
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Factories
+# =============================================================================
 
 
 def make_sequence_dataset(
@@ -103,15 +77,10 @@ def make_sequence_dataset(
     num_rows: int = 40,
     context_window: int = CONTEXT_WINDOW,
     feature_names: tuple[str, ...] = FEATURE_NAMES,
-    start_timestamp: float = 1000.0,
+    start_timestamp: float = START_TIMESTAMP,
     timestamp_step: float = 1.0,
 ) -> SequenceDataset:
-    """
-    Create a deterministic SequenceDataset for testing.
-
-    Each sequence is filled with deterministic values so that individual
-    sequence samples can be traced through the alignment process.
-    """
+    """Create deterministic rolling sequences with traceable values."""
 
     if num_rows < context_window:
         raise ValueError(
@@ -130,34 +99,35 @@ def make_sequence_dataset(
         dtype=np.float64,
     )
 
-    for sequence_index in range(num_sequences):
+    for sample in range(num_sequences):
         for timestep in range(context_window):
-            for feature_index in range(num_features):
+            for feature in range(num_features):
                 sequences[
-                    sequence_index,
+                    sample,
                     timestep,
-                    feature_index,
+                    feature,
                 ] = (
-                    sequence_index * 1000
+                    sample * 1000
                     + timestep * 10
-                    + feature_index
+                    + feature
                 )
 
-    all_timestamps = (
+    timestamps = (
         start_timestamp
-        + np.arange(num_rows, dtype=np.float64) * timestamp_step
+        + np.arange(num_rows, dtype=np.float64)
+        * timestamp_step
     )
 
-    timestamps = [
-        all_timestamps[
-            sequence_index : sequence_index + context_window
+    windows = [
+        timestamps[
+            index : index + context_window
         ].tolist()
-        for sequence_index in range(num_sequences)
+        for index in range(num_sequences)
     ]
 
     return SequenceDataset(
         sequences=sequences,
-        timestamps=timestamps,
+        timestamps=windows,
         feature_names=list(feature_names),
         context_window=context_window,
     )
@@ -169,24 +139,21 @@ def make_target_dataset(
     forecast_horizon: int = FORECAST_HORIZON,
     target_name: str = TARGET_NAME,
     price_column: str = PRICE_COLUMN,
-    start_timestamp: float = 1000.0,
+    start_timestamp: float = START_TIMESTAMP,
     timestamp_step: float = 1.0,
     target_offset: float = 0.0,
 ) -> TargetDataset:
-    """
-    Create a deterministic TargetDataset for testing.
-
-    Target values are directly tied to their timestamps so alignment errors
-    are easy to detect.
-    """
+    """Create deterministic timestamp-keyed targets."""
 
     timestamps = (
         start_timestamp
-        + np.arange(num_rows, dtype=np.float64) * timestamp_step
+        + np.arange(num_rows, dtype=np.float64)
+        * timestamp_step
     )
 
     targets = (
-        np.arange(num_rows, dtype=np.float64) * 0.001
+        np.arange(num_rows, dtype=np.float64)
+        * 0.001
         + target_offset
     )
 
@@ -205,51 +172,40 @@ def make_forecasting_dataset(
     context_window: int = CONTEXT_WINDOW,
     forecast_horizon: int = FORECAST_HORIZON,
 ) -> ForecastingDataset:
-    """
-    Build a complete ForecastingDataset using the public builder API.
-    """
-
-    sequence_dataset = make_sequence_dataset(
-        num_rows=num_rows,
-        context_window=context_window,
-    )
-
-    target_dataset = make_target_dataset(
-        num_rows=num_rows,
-        forecast_horizon=forecast_horizon,
-    )
+    """Create a complete aligned forecasting dataset."""
 
     return build_forecasting_dataset(
-        sequence_dataset,
-        target_dataset,
+        make_sequence_dataset(
+            num_rows=num_rows,
+            context_window=context_window,
+        ),
+        make_target_dataset(
+            num_rows=num_rows,
+            forecast_horizon=forecast_horizon,
+        ),
     )
 
 
-# ---------------------------------------------------------------------------
-# Basic construction
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Construction and Shape
+# =============================================================================
 
 
-class TestForecastingDatasetConstruction:
-    """Tests for basic ForecastingDataset construction."""
+class TestConstructionAndShape:
+    """Validate construction and fundamental array shapes."""
 
-    def test_builds_successfully(self):
-        """A valid sequence/target pair produces a dataset."""
+    def test_valid_inputs_build_dataset(self):
+        """Valid sequence and target datasets produce a forecasting dataset."""
 
         dataset = make_forecasting_dataset()
 
-        assert isinstance(dataset, ForecastingDataset)
+        assert isinstance(
+            dataset,
+            ForecastingDataset,
+        )
 
     def test_expected_sample_count(self):
-        """
-        Sequence count is aligned against target timestamps.
-
-        For 40 raw observations and context 20:
-
-            sequences = 40 - 20 + 1 = 21
-
-        All 21 sequence-ending timestamps exist in the target dataset.
-        """
+        """Forty observations and a twenty-step context produce 21 sequences."""
 
         dataset = make_forecasting_dataset(
             num_rows=40,
@@ -259,55 +215,60 @@ class TestForecastingDatasetConstruction:
         assert dataset.num_samples == 21
 
     def test_expected_feature_count(self):
-        """The dataset preserves all 14 NVIDIA forecasting features."""
+        """The forecasting dataset contains all 14 NVIDIA features."""
 
         dataset = make_forecasting_dataset()
 
         assert dataset.num_features == 14
 
-    def test_expected_sequence_shape(self):
-        """The complete model input batch has shape (N, 20, 14)."""
+    def test_complete_shape(self):
+        """The complete feature tensor has shape (N, 20, 14)."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.shape == (21, 20, 14)
+        assert dataset.shape == (
+            21,
+            20,
+            14,
+        )
 
-    def test_expected_input_shape(self):
-        """
-        input_shape exposes the shape of one model input sample.
-
-        The complete dataset has shape:
-
-            (N, context_window, num_features)
-
-        while one model input has shape:
-
-            (context_window, num_features)
-        """
+    def test_single_input_shape(self):
+        """One model input has shape (20, 14)."""
 
         dataset = make_forecasting_dataset()
 
         assert dataset.input_shape == (
-            CONTEXT_WINDOW,
-            len(FEATURE_NAMES),
+            20,
+            14,
         )
 
-    def test_target_shape(self):
-        """Targets are one-dimensional and sample-aligned."""
+    def test_model_input_shape_alias_matches_input_shape(self):
+        """model_input_shape must remain an explicit alias of input_shape."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.targets.shape == (21,)
+        assert dataset.model_input_shape == dataset.input_shape
+
+    def test_target_shape(self):
+        """Targets have one value per aligned forecasting sample."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.target_shape == (
+            dataset.num_samples,
+        )
 
     def test_timestamp_shape(self):
-        """Sequence-end timestamps are one-dimensional."""
+        """Timestamps have one value per aligned forecasting sample."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.timestamps.shape == (21,)
+        assert dataset.timestamp_shape == (
+            dataset.num_samples,
+        )
 
-    def test_sequence_dtype(self):
-        """Sequences are represented as floating-point values."""
+    def test_sequence_dtype_is_float(self):
+        """Feature sequences are represented numerically as floating-point data."""
 
         dataset = make_forecasting_dataset()
 
@@ -316,8 +277,8 @@ class TestForecastingDatasetConstruction:
             np.floating,
         )
 
-    def test_target_dtype(self):
-        """Targets are represented as floating-point values."""
+    def test_target_dtype_is_float(self):
+        """Targets are represented as floating-point data."""
 
         dataset = make_forecasting_dataset()
 
@@ -326,8 +287,8 @@ class TestForecastingDatasetConstruction:
             np.floating,
         )
 
-    def test_timestamp_dtype(self):
-        """Timestamps are represented as floating-point values."""
+    def test_timestamp_dtype_is_float(self):
+        """Timestamps are represented as floating-point data."""
 
         dataset = make_forecasting_dataset()
 
@@ -336,157 +297,125 @@ class TestForecastingDatasetConstruction:
             np.floating,
         )
 
+    @pytest.mark.parametrize(
+        "context_window",
+        [1, 2, 5, 10, 20, 25],
+    )
+    def test_valid_context_windows(
+        self,
+        context_window: int,
+    ):
+        """Different valid context windows preserve the expected tensor shape."""
 
-# ---------------------------------------------------------------------------
-# Alignment
-# ---------------------------------------------------------------------------
+        num_rows = context_window + 10
 
+        dataset = make_forecasting_dataset(
+            num_rows=num_rows,
+            context_window=context_window,
+        )
 
-class TestSequenceTargetAlignment:
-    """Tests for exact sequence/target timestamp alignment."""
+        expected_sequences = (
+            num_rows - context_window + 1
+        )
 
-    def test_alignment_uses_sequence_end_timestamp(self):
-        """
-        Each sequence must receive the target associated with the timestamp
-        at the END of that sequence.
+        assert dataset.shape == (
+            expected_sequences,
+            context_window,
+            14,
+        )
 
-        The first sequence covers timestamps 1000 through 1019, so its
-        target must be the target at timestamp 1019.
-        """
+    def test_context_equal_history_length_produces_one_sample(self):
+        """A context equal to the complete history produces one sequence."""
 
-        sequences = make_sequence_dataset(
-            num_rows=40,
+        dataset = make_forecasting_dataset(
+            num_rows=20,
             context_window=20,
         )
 
-        targets = make_target_dataset(
-            num_rows=40,
+        assert dataset.shape == (
+            1,
+            20,
+            14,
         )
 
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
+    def test_context_window_one_is_valid(self):
+        """A one-step context remains a valid forecasting input."""
+
+        dataset = make_forecasting_dataset(
+            num_rows=10,
+            context_window=1,
         )
 
-        expected_first_timestamp = 1000.0 + 19.0
-        assert dataset.timestamps[0] == expected_first_timestamp
+        assert dataset.shape == (
+            10,
+            1,
+            14,
+        )
 
-        expected_first_target = 19 * 0.001
+
+# =============================================================================
+# Timestamp Alignment
+# =============================================================================
+
+
+class TestTimestampAlignment:
+    """Validate exact timestamp-based sequence/target alignment."""
+
+    def test_first_sample_uses_sequence_end_timestamp(self):
+        """The first sequence must align to its ending timestamp."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.timestamps[0] == pytest.approx(
+            1019.0
+        )
+
+    def test_first_target_matches_sequence_end_timestamp(self):
+        """The first target must correspond to timestamp 1019."""
+
+        dataset = make_forecasting_dataset()
+
         assert dataset.targets[0] == pytest.approx(
-            expected_first_target
+            0.019
         )
 
-    def test_second_sequence_uses_second_end_timestamp(self):
-        """The second sequence is aligned to its own ending timestamp."""
+    def test_second_sample_uses_second_sequence_end(self):
+        """The second sequence must align to timestamp 1020."""
 
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=40,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
+        dataset = make_forecasting_dataset()
 
         assert dataset.timestamps[1] == pytest.approx(
             1020.0
         )
 
         assert dataset.targets[1] == pytest.approx(
-            20 * 0.001
+            0.020
         )
 
-    def test_alignment_does_not_use_array_index(self):
+    def test_alignment_is_not_index_based(self):
         """
-        Targets are deliberately shifted so index-based alignment would
-        produce incorrect values.
+        A shifted target value makes positional alignment visibly incorrect.
 
-        Correct behavior still follows timestamps.
+        The builder must use timestamp identity rather than equal array
+        positions.
         """
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=40,
-            target_offset=10.0,
-        )
 
         dataset = build_forecasting_dataset(
-            sequences,
-            targets,
+            make_sequence_dataset(),
+            make_target_dataset(
+                target_offset=10.0,
+            ),
         )
 
         assert dataset.targets[0] == pytest.approx(
             10.019
         )
 
-    def test_target_timestamps_before_first_sequence_are_ignored(self):
-        """
-        Targets that occur before the first usable sequence timestamp do
-        not become incorrectly aligned.
-        """
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=40,
-            start_timestamp=990.0,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert dataset.timestamps[0] == pytest.approx(
-            1019.0
-        )
-
-        assert dataset.targets[0] == pytest.approx(
-            29 * 0.001
-        )
-
-    def test_target_timestamps_after_last_sequence_are_ignored(self):
-        """Unused future targets do not create extra forecasting samples."""
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=60,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert dataset.num_samples == sequences.sequences.shape[0]
-
-    def test_output_timestamps_match_sequence_end_timestamps(self):
+    def test_every_output_timestamp_is_a_sequence_end(self):
         """Every output timestamp equals the corresponding sequence end."""
 
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=40,
-        )
+        sequences = make_sequence_dataset()
+        targets = make_target_dataset()
 
         dataset = build_forecasting_dataset(
             sequences,
@@ -506,85 +435,114 @@ class TestSequenceTargetAlignment:
             expected,
         )
 
-    def test_output_targets_follow_timestamp_mapping(self):
-        """Every target corresponds to its output timestamp."""
+    def test_every_target_is_mapped_by_timestamp(self):
+        """Every aligned target follows its timestamp mapping."""
 
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
+        dataset = make_forecasting_dataset()
 
-        targets = make_target_dataset(
-            num_rows=40,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        expected_targets = (
-            dataset.timestamps - 1000.0
+        expected = (
+            dataset.timestamps
+            - START_TIMESTAMP
         ) * 0.001
 
         np.testing.assert_allclose(
             dataset.targets,
-            expected_targets,
+            expected,
         )
 
+    def test_early_targets_are_ignored(self):
+        """Targets occurring before the first sequence end are ignored."""
 
-# ---------------------------------------------------------------------------
-# Leakage protection
-# ---------------------------------------------------------------------------
-
-
-class TestTemporalLeakageProtection:
-    """Tests that verify the alignment does not introduce temporal leakage."""
-
-    def test_sequence_end_is_not_after_target_timestamp(self):
-        """
-        A forecasting sample must never use a target from before the end of
-        its feature sequence.
-        """
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            make_target_dataset(
+                start_timestamp=990.0,
+            ),
         )
 
-        targets = make_target_dataset(
-            num_rows=40,
+        assert dataset.timestamps[0] == pytest.approx(
+            1019.0
         )
+
+        assert dataset.targets[0] == pytest.approx(
+            0.029
+        )
+
+    def test_extra_future_targets_do_not_create_samples(self):
+        """Extra target timestamps cannot create feature sequences."""
+
+        sequences = make_sequence_dataset()
 
         dataset = build_forecasting_dataset(
             sequences,
-            targets,
+            make_target_dataset(
+                num_rows=100,
+            ),
         )
 
-        for timestamp in dataset.timestamps:
-            assert np.isfinite(timestamp)
-
-    def test_targets_are_attached_to_current_observation_timestamp(self):
-        """
-        Target timestamps represent the current observation t.
-
-        The target value itself represents the future movement beginning
-        from t, so the target timestamp must not be shifted to t+h.
-        """
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
+        assert dataset.num_samples == (
+            sequences.num_sequences
         )
 
-        targets = make_target_dataset(
-            num_rows=40,
-        )
+    def test_non_unit_timestamp_spacing_is_supported(self):
+        """Timestamp alignment works with non-unit intervals."""
 
         dataset = build_forecasting_dataset(
-            sequences,
-            targets,
+            make_sequence_dataset(
+                num_rows=30,
+                context_window=10,
+                timestamp_step=0.5,
+            ),
+            make_target_dataset(
+                num_rows=30,
+                timestamp_step=0.5,
+            ),
         )
+
+        assert dataset.timestamps[0] == pytest.approx(
+            1004.5
+        )
+
+        assert dataset.timestamps[1] == pytest.approx(
+            1005.0
+        )
+
+
+# =============================================================================
+# Temporal Safety
+# =============================================================================
+
+
+class TestTemporalSafety:
+    """Validate chronological and leakage-safe output."""
+
+    def test_output_is_strictly_chronological(self):
+        """Aligned timestamps must increase strictly."""
+
+        dataset = make_forecasting_dataset()
+
+        assert np.all(
+            np.diff(dataset.timestamps) > 0
+        )
+
+    def test_output_timestamps_are_unique(self):
+        """Aligned timestamps must be unique."""
+
+        dataset = make_forecasting_dataset()
+
+        assert len(
+            np.unique(dataset.timestamps)
+        ) == dataset.num_samples
+
+    def test_target_timestamp_is_current_observation_timestamp(self):
+        """
+        Targets remain attached to the current observation timestamp t.
+
+        The future horizon is represented by the target value, not by shifting
+        the dataset timestamp to t+h.
+        """
+
+        dataset = make_forecasting_dataset()
 
         assert dataset.timestamps[0] == pytest.approx(
             1019.0
@@ -594,53 +552,99 @@ class TestTemporalLeakageProtection:
             1039.0
         )
 
-    def test_output_is_chronological(self):
-        """Aligned samples remain strictly chronological."""
+    def test_alignment_never_fabricates_target_values(self):
+        """Every output timestamp must exist in the target dataset."""
 
-        dataset = make_forecasting_dataset()
+        target_dataset = make_target_dataset(
+            num_rows=25,
+        )
 
-        differences = np.diff(dataset.timestamps)
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            target_dataset,
+        )
 
-        assert np.all(differences > 0)
+        valid_timestamps = set(
+            target_dataset.timestamps
+        )
 
-    def test_output_timestamps_are_unique(self):
-        """Aligned timestamps must not be duplicated."""
+        assert all(
+            float(timestamp) in valid_timestamps
+            for timestamp in dataset.timestamps
+        )
 
-        dataset = make_forecasting_dataset()
+    def test_disjoint_timestamps_are_rejected(self):
+        """Completely disjoint datasets cannot produce aligned samples."""
 
-        assert len(np.unique(dataset.timestamps)) == (
-            len(dataset.timestamps)
+        with pytest.raises(ValueError):
+            build_forecasting_dataset(
+                make_sequence_dataset(
+                    start_timestamp=1000.0,
+                ),
+                make_target_dataset(
+                    start_timestamp=2000.0,
+                ),
+            )
+
+    def test_strict_alignment_rejects_unmatched_sequences(self):
+        """Strict mode must reject any unmatched sequence timestamp."""
+
+        with pytest.raises(ValueError):
+            build_forecasting_dataset(
+                make_sequence_dataset(),
+                make_target_dataset(
+                    num_rows=25,
+                ),
+                config=ForecastingDatasetConfig(
+                    drop_unaligned=False,
+                ),
+            )
+
+    def test_default_alignment_drops_unmatched_sequences(self):
+        """Default alignment drops sequence windows without targets."""
+
+        sequences = make_sequence_dataset()
+
+        dataset = build_forecasting_dataset(
+            sequences,
+            make_target_dataset(
+                num_rows=25,
+            ),
+        )
+
+        assert dataset.num_samples < (
+            sequences.num_sequences
         )
 
 
-# ---------------------------------------------------------------------------
-# Metadata preservation
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Metadata and NVIDIA Contract
+# =============================================================================
 
 
-class TestMetadataPreservation:
-    """Tests for forecasting dataset metadata."""
+class TestMetadataAndNvidiaContract:
+    """Validate metadata preservation and canonical NVIDIA structure."""
 
     def test_feature_names_are_preserved(self):
-        """The exact feature schema is preserved."""
+        """The exact ordered feature schema is preserved."""
 
         dataset = make_forecasting_dataset()
 
         assert dataset.feature_names == FEATURE_NAMES
 
     def test_context_window_is_preserved(self):
-        """The context window remains part of the model contract."""
+        """The sequence context remains part of the dataset contract."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.context_window == CONTEXT_WINDOW
+        assert dataset.context_window == 20
 
     def test_forecast_horizon_is_preserved(self):
         """The target forecast horizon is preserved."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.forecast_horizon == FORECAST_HORIZON
+        assert dataset.forecast_horizon == 5
 
     def test_target_name_is_preserved(self):
         """The target name is preserved."""
@@ -650,36 +654,32 @@ class TestMetadataPreservation:
         assert dataset.target_name == TARGET_NAME
 
     def test_price_column_is_preserved(self):
-        """The source price column metadata is preserved."""
+        """The source price-column metadata is preserved."""
 
         dataset = make_forecasting_dataset()
 
         assert dataset.price_column == PRICE_COLUMN
 
     def test_custom_metadata_is_preserved(self):
-        """Custom feature and target metadata survive alignment."""
+        """Custom metadata survives the alignment stage."""
 
         custom_features = (
             "feature_a",
             "feature_b",
         )
 
-        sequences = make_sequence_dataset(
-            num_rows=10,
-            context_window=4,
-            feature_names=custom_features,
-        )
-
-        targets = make_target_dataset(
-            num_rows=10,
-            forecast_horizon=3,
-            target_name="custom_target",
-            price_column="custom_price",
-        )
-
         dataset = build_forecasting_dataset(
-            sequences,
-            targets,
+            make_sequence_dataset(
+                num_rows=10,
+                context_window=4,
+                feature_names=custom_features,
+            ),
+            make_target_dataset(
+                num_rows=10,
+                forecast_horizon=3,
+                target_name="custom_target",
+                price_column="custom_price",
+            ),
         )
 
         assert dataset.feature_names == custom_features
@@ -688,83 +688,307 @@ class TestMetadataPreservation:
         assert dataset.target_name == "custom_target"
         assert dataset.price_column == "custom_price"
 
-
-# ---------------------------------------------------------------------------
-# Model-facing API
-# ---------------------------------------------------------------------------
-
-
-class TestModelFacingContract:
-    """Tests for the NVIDIA forecasting model-facing dataset contract."""
-
-    def test_model_input_is_three_dimensional(self):
-        """NVIDIA input must be a 3D tensor-like array."""
+    def test_nvidia_input_shape_is_20_by_14(self):
+        """The canonical NVIDIA single-sample input is (20, 14)."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.sequences.ndim == 3
-
-    def test_model_input_has_expected_context_dimension(self):
-        """The middle dimension equals the configured context window."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.sequences.shape[1] == CONTEXT_WINDOW
-
-    def test_model_input_has_expected_feature_dimension(self):
-        """The final dimension equals the number of model features."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.sequences.shape[2] == len(
-            FEATURE_NAMES
+        assert dataset.input_shape == (
+            20,
+            14,
         )
 
-    def test_model_targets_are_one_dimensional(self):
-        """Forecast targets have shape (N,)."""
+    def test_nvidia_batch_shape_is_n_by_20_by_14(self):
+        """The canonical NVIDIA batch shape is (N, 20, 14)."""
+
+        dataset = make_forecasting_dataset(
+            num_rows=100,
+        )
+
+        assert dataset.shape[1:] == (
+            20,
+            14,
+        )
+
+    def test_nvidia_target_is_one_dimensional(self):
+        """The forecasting target remains one-dimensional."""
 
         dataset = make_forecasting_dataset()
 
         assert dataset.targets.ndim == 1
 
-    def test_model_input_and_target_sample_counts_match(self):
-        """Every input sequence has exactly one target."""
+    def test_nvidia_feature_order_is_exact(self):
+        """The canonical 14-feature order remains unchanged."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.sequences.shape[0] == (
-            dataset.targets.shape[0]
-        )
+        assert dataset.feature_names == FEATURE_NAMES
 
-    def test_input_shape_property_matches_sequences(self):
-        """
-        input_shape accurately reports the shape of one model input sample.
 
-        The full sequence tensor has shape:
+# =============================================================================
+# Model-Facing API
+# =============================================================================
 
-            (N, context_window, num_features)
 
-        Therefore input_shape must equal:
+class TestModelFacingAPI:
+    """Validate APIs consumed by downstream model integrations."""
 
-            (context_window, num_features)
-        """
+    def test_get_sample_returns_sequence_target_timestamp(self):
+        """get_sample returns all three components of one aligned sample."""
 
         dataset = make_forecasting_dataset()
 
-        assert dataset.input_shape == (
-            dataset.sequences.shape[1],
-            dataset.sequences.shape[2],
+        sequence, target, timestamp = (
+            dataset.get_sample(0)
         )
 
-    def test_shape_property_matches_sequences(self):
-        """shape accurately reports the complete feature tensor shape."""
+        assert sequence.shape == (
+            20,
+            14,
+        )
+
+        assert target == pytest.approx(
+            0.019
+        )
+
+        assert timestamp == pytest.approx(
+            1019.0
+        )
+
+    def test_get_sample_middle_index_is_correct(self):
+        """get_sample works for an interior sample."""
+
+        dataset = make_forecasting_dataset()
+
+        sequence, target, timestamp = (
+            dataset.get_sample(5)
+        )
+
+        assert sequence.shape == (
+            20,
+            14,
+        )
+
+        assert target == pytest.approx(
+            0.024
+        )
+
+        assert timestamp == pytest.approx(
+            1024.0
+        )
+
+    def test_get_sample_rejects_negative_index(self):
+        """Negative indices are rejected by the explicit dataset API."""
+
+        dataset = make_forecasting_dataset()
+
+        with pytest.raises(IndexError):
+            dataset.get_sample(-1)
+
+    def test_get_sample_rejects_upper_bound(self):
+        """Indices equal to num_samples are rejected."""
+
+        dataset = make_forecasting_dataset()
+
+        with pytest.raises(IndexError):
+            dataset.get_sample(
+                dataset.num_samples
+            )
+
+    @pytest.mark.parametrize(
+        "index",
+        [
+            0.0,
+            "0",
+            True,
+            None,
+        ],
+    )
+    def test_get_sample_rejects_non_integer_index(
+        self,
+        index,
+    ):
+        """get_sample requires a real integer index."""
+
+        dataset = make_forecasting_dataset()
+
+        with pytest.raises(TypeError):
+            dataset.get_sample(index)
+
+    def test_to_model_input_returns_single_sequence(self):
+        """to_model_input returns one (20, 14) model input."""
+
+        dataset = make_forecasting_dataset()
+
+        model_input = dataset.to_model_input(0)
+
+        assert model_input.shape == (
+            20,
+            14,
+        )
+
+        np.testing.assert_array_equal(
+            model_input,
+            dataset.sequences[0],
+        )
+
+    def test_to_model_input_excludes_target_and_timestamp(self):
+        """Single model input contains only the feature sequence."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.to_model_input(0).ndim == 2
+
+    def test_to_model_batch_returns_complete_tensor(self):
+        """to_model_batch returns the complete feature tensor."""
+
+        dataset = make_forecasting_dataset()
+
+        batch = dataset.to_model_batch()
+
+        assert batch.shape == dataset.shape
+
+        np.testing.assert_array_equal(
+            batch,
+            dataset.sequences,
+        )
+
+    def test_to_model_input_copy_is_independent(self):
+        """The default model-input copy does not mutate the dataset."""
+
+        dataset = make_forecasting_dataset()
+
+        result = dataset.to_model_input(
+            0,
+            copy=True,
+        )
+
+        original = dataset.sequences[
+            0,
+            0,
+            0,
+        ]
+
+        result[0, 0] = 999999.0
+
+        assert dataset.sequences[
+            0,
+            0,
+            0,
+        ] == original
+
+    def test_to_model_batch_copy_is_independent(self):
+        """The default model-batch copy does not mutate the dataset."""
+
+        dataset = make_forecasting_dataset()
+
+        result = dataset.to_model_batch(
+            copy=True,
+        )
+
+        original = dataset.sequences[
+            0,
+            0,
+            0,
+        ]
+
+        result[0, 0, 0] = 999999.0
+
+        assert dataset.sequences[
+            0,
+            0,
+            0,
+        ] == original
+
+    def test_to_model_input_copy_false_exposes_underlying_array(self):
+        """copy=False intentionally returns the underlying sequence."""
+
+        dataset = make_forecasting_dataset()
+
+        result = dataset.to_model_input(
+            0,
+            copy=False,
+        )
+
+        result[0, 0] = 999999.0
+
+        assert dataset.sequences[
+            0,
+            0,
+            0,
+        ] == 999999.0
+
+    def test_to_model_batch_copy_false_exposes_underlying_array(self):
+        """copy=False intentionally returns the underlying tensor."""
+
+        dataset = make_forecasting_dataset()
+
+        result = dataset.to_model_batch(
+            copy=False,
+        )
+
+        result[0, 0, 0] = 999999.0
+
+        assert dataset.sequences[
+            0,
+            0,
+            0,
+        ] == 999999.0
+
+
+# =============================================================================
+# Dataset Properties and Copying
+# =============================================================================
+
+
+class TestDatasetProperties:
+    """Validate compact properties and independent dataset copies."""
+
+    def test_num_samples_matches_first_sequence_dimension(self):
+        """num_samples reflects the batch dimension."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.num_samples == (
+            dataset.sequences.shape[0]
+        )
+
+    def test_num_features_matches_last_sequence_dimension(self):
+        """num_features reflects the feature dimension."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.num_features == (
+            dataset.sequences.shape[2]
+        )
+
+    def test_shape_matches_sequence_shape(self):
+        """shape exactly describes the feature tensor."""
 
         dataset = make_forecasting_dataset()
 
         assert dataset.shape == dataset.sequences.shape
 
-    def test_target_values_property_matches_targets(self):
-        """target_values exposes the underlying target values."""
+    def test_target_shape_matches_targets(self):
+        """target_shape exactly describes the target array."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.target_shape == (
+            dataset.targets.shape
+        )
+
+    def test_timestamp_shape_matches_timestamps(self):
+        """timestamp_shape exactly describes the timestamp array."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.timestamp_shape == (
+            dataset.timestamps.shape
+        )
+
+    def test_target_values_alias_matches_targets(self):
+        """target_values exposes the same target values."""
 
         dataset = make_forecasting_dataset()
 
@@ -773,17 +997,107 @@ class TestModelFacingContract:
             dataset.targets,
         )
 
+    def test_feature_tensor_alias_matches_sequences(self):
+        """feature_tensor exposes the same feature tensor."""
 
-# ---------------------------------------------------------------------------
-# Configuration behavior
-# ---------------------------------------------------------------------------
+        dataset = make_forecasting_dataset()
+
+        np.testing.assert_array_equal(
+            dataset.feature_tensor,
+            dataset.sequences,
+        )
+
+    def test_earliest_timestamp_is_first(self):
+        """earliest_timestamp returns the first aligned timestamp."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.earliest_timestamp == pytest.approx(
+            dataset.timestamps[0]
+        )
+
+    def test_latest_timestamp_is_last(self):
+        """latest_timestamp returns the final aligned timestamp."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.latest_timestamp == pytest.approx(
+            dataset.timestamps[-1]
+        )
+
+    def test_copy_returns_independent_dataset(self):
+        """copy() returns a separate ForecastingDataset."""
+
+        dataset = make_forecasting_dataset()
+
+        copied = dataset.copy()
+
+        assert copied is not dataset
+
+        np.testing.assert_array_equal(
+            copied.sequences,
+            dataset.sequences,
+        )
+
+        np.testing.assert_array_equal(
+            copied.targets,
+            dataset.targets,
+        )
+
+        np.testing.assert_array_equal(
+            copied.timestamps,
+            dataset.timestamps,
+        )
+
+    def test_copy_is_independent_for_sequences(self):
+        """Changing copied sequences does not affect the original."""
+
+        dataset = make_forecasting_dataset()
+        copied = dataset.copy()
+
+        copied.sequences[
+            0,
+            0,
+            0,
+        ] = 123456.0
+
+        assert dataset.sequences[
+            0,
+            0,
+            0,
+        ] != 123456.0
+
+    def test_copy_is_independent_for_targets(self):
+        """Changing copied targets does not affect the original."""
+
+        dataset = make_forecasting_dataset()
+        copied = dataset.copy()
+
+        copied.targets[0] = 123456.0
+
+        assert dataset.targets[0] != 123456.0
+
+    def test_copy_is_independent_for_timestamps(self):
+        """Changing copied timestamps does not affect the original."""
+
+        dataset = make_forecasting_dataset()
+        copied = dataset.copy()
+
+        copied.timestamps[0] = 123456.0
+
+        assert dataset.timestamps[0] != 123456.0
 
 
-class TestForecastingDatasetConfiguration:
-    """Tests for ForecastingDatasetConfig behavior."""
+# =============================================================================
+# Configuration and Dtype
+# =============================================================================
+
+
+class TestConfiguration:
+    """Validate ForecastingDatasetBuilder configuration behavior."""
 
     def test_default_configuration(self):
-        """Default configuration is available."""
+        """Default configuration matches the pipeline contract."""
 
         config = ForecastingDatasetConfig()
 
@@ -793,204 +1107,178 @@ class TestForecastingDatasetConfiguration:
         assert config.copy_arrays is True
         assert config.dtype == "float64"
 
-    def test_drop_unaligned_can_be_disabled(self):
-        """The configuration can require complete alignment."""
+    def test_custom_flags_are_preserved(self):
+        """Custom configuration flags remain unchanged."""
 
         config = ForecastingDatasetConfig(
             drop_unaligned=False,
-        )
-
-        assert config.drop_unaligned is False
-
-    def test_copy_arrays_can_be_disabled(self):
-        """Copy behavior is configurable."""
-
-        config = ForecastingDatasetConfig(
+            require_chronological_order=False,
+            require_unique_timestamps=False,
             copy_arrays=False,
         )
 
+        assert config.drop_unaligned is False
+        assert config.require_chronological_order is False
+        assert config.require_unique_timestamps is False
         assert config.copy_arrays is False
 
-    def test_dtype_can_be_configured(self):
-        """Output dtype can be configured."""
+    def test_float32_output_is_supported(self):
+        """The builder can produce float32 arrays."""
 
-        config = ForecastingDatasetConfig(
-            dtype="float32",
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            make_target_dataset(),
+            config=ForecastingDatasetConfig(
+                dtype="float32",
+            ),
         )
 
-        assert config.dtype == "float32"
+        assert dataset.sequences.dtype == np.float32
+        assert dataset.targets.dtype == np.float32
+        assert dataset.timestamps.dtype == np.float32
 
     def test_invalid_dtype_is_rejected(self):
-        """Invalid NumPy dtypes are rejected."""
+        """Invalid NumPy dtypes are rejected immediately."""
 
         with pytest.raises(ValueError):
             ForecastingDatasetConfig(
                 dtype="not-a-real-dtype",
             )
 
+    def test_copy_arrays_true_is_default(self):
+        """Array copying is enabled by default."""
 
-# ---------------------------------------------------------------------------
-# Unaligned timestamp handling
-# ---------------------------------------------------------------------------
+        assert ForecastingDatasetConfig().copy_arrays is True
 
-
-class TestUnalignedTimestampHandling:
-    """Tests for missing sequence/target timestamp matches."""
-
-    def test_unaligned_sequences_are_dropped_by_default(self):
-        """
-        When drop_unaligned=True, sequence samples without matching targets
-        are removed.
-        """
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=25,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert dataset.num_samples < (
-            sequences.sequences.shape[0]
-        )
-
-    def test_unaligned_sequences_are_not_silently_used(self):
-        """Unmatched sequence timestamps never receive arbitrary targets."""
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=25,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert np.all(
-            np.isin(
-                dataset.timestamps,
-                targets.timestamps,
-            )
-        )
-
-    def test_drop_unaligned_false_raises(self):
-        """Strict alignment mode rejects missing target timestamps."""
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=25,
-        )
-
-        config = ForecastingDatasetConfig(
-            drop_unaligned=False,
-        )
-
-        builder = ForecastingDatasetBuilder(
-            config=config,
-        )
-
-        with pytest.raises(ValueError):
-            builder.build(
-                sequences,
-                targets,
-            )
-
-    def test_no_overlap_raises(self):
-        """Completely disjoint sequence/target timestamps are rejected."""
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-            start_timestamp=1000.0,
-        )
-
-        targets = make_target_dataset(
-            num_rows=40,
-            start_timestamp=2000.0,
-        )
+    def test_drop_unaligned_false_requires_complete_matching(self):
+        """Strict alignment rejects unmatched sequence endpoints."""
 
         with pytest.raises(ValueError):
             build_forecasting_dataset(
-                sequences,
-                targets,
+                make_sequence_dataset(),
+                make_target_dataset(
+                    num_rows=25,
+                ),
+                config=ForecastingDatasetConfig(
+                    drop_unaligned=False,
+                ),
             )
 
 
-# ---------------------------------------------------------------------------
-# Input validation
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Input Validation
+# =============================================================================
 
 
 class TestInputValidation:
-    """Tests for invalid input handling."""
+    """Validate rejection of invalid builder and source-contract inputs."""
 
-    def test_invalid_sequence_dataset_type_raises(self):
-        """The builder rejects non-SequenceDataset inputs."""
-
-        targets = make_target_dataset()
+    def test_invalid_sequence_dataset_type(self):
+        """The builder rejects non-SequenceDataset input."""
 
         with pytest.raises(TypeError):
             build_forecasting_dataset(
-                "not-a-sequence-dataset",
-                targets,
+                "invalid",
+                make_target_dataset(),
             )
 
-    def test_invalid_target_dataset_type_raises(self):
-        """The builder rejects non-TargetDataset inputs."""
-
-        sequences = make_sequence_dataset()
+    def test_invalid_target_dataset_type(self):
+        """The builder rejects non-TargetDataset input."""
 
         with pytest.raises(TypeError):
             build_forecasting_dataset(
-                sequences,
-                "not-a-target-dataset",
+                make_sequence_dataset(),
+                "invalid",
             )
 
-    def test_empty_feature_names_are_rejected(self):
-        """SequenceDataset itself must contain feature names."""
+    def test_empty_sequence_dataset_is_rejected_by_source_contract(self):
+        """The source SequenceDataset contract rejects zero samples."""
 
         with pytest.raises(ValueError):
             SequenceDataset(
-                sequences=np.ones(
-                    (2, 3, 0),
+                sequences=np.empty(
+                    (
+                        0,
+                        20,
+                        14,
+                    ),
                     dtype=np.float64,
                 ),
+                timestamps=[],
+                feature_names=list(FEATURE_NAMES),
+                context_window=20,
+            )
+
+    def test_nonpositive_target_horizon_is_rejected(self):
+        """A target forecast horizon must be positive."""
+
+        with pytest.raises(ValueError):
+            TargetDataset(
+                targets=np.array(
+                    [0.1]
+                ),
                 timestamps=[
-                    [1.0, 2.0, 3.0],
-                    [2.0, 3.0, 4.0],
+                    1.0
                 ],
-                feature_names=[],
-                context_window=3,
+                target_name=TARGET_NAME,
+                forecast_horizon=0,
+            )
+
+    def test_empty_target_name_is_rejected(self):
+        """TargetDataset requires a non-empty target name."""
+
+        with pytest.raises(ValueError):
+            TargetDataset(
+                targets=np.array(
+                    [0.1]
+                ),
+                timestamps=[
+                    1.0
+                ],
+                target_name="",
+                forecast_horizon=5,
+            )
+
+    def test_empty_price_column_is_rejected(self):
+        """TargetDataset requires a non-empty price column."""
+
+        with pytest.raises(ValueError):
+            TargetDataset(
+                targets=np.array(
+                    [0.1]
+                ),
+                timestamps=[
+                    1.0
+                ],
+                target_name=TARGET_NAME,
+                forecast_horizon=5,
+                price_column="",
             )
 
     def test_duplicate_feature_names_are_rejected(self):
-        """Feature schemas must contain unique names."""
+        """Feature schemas cannot contain duplicate names."""
 
         with pytest.raises(ValueError):
             SequenceDataset(
                 sequences=np.ones(
-                    (2, 3, 2),
+                    (
+                        2,
+                        3,
+                        2,
+                    ),
                     dtype=np.float64,
                 ),
                 timestamps=[
-                    [1.0, 2.0, 3.0],
-                    [2.0, 3.0, 4.0],
+                    [
+                        1.0,
+                        2.0,
+                        3.0,
+                    ],
+                    [
+                        2.0,
+                        3.0,
+                        4.0,
+                    ],
                 ],
                 feature_names=[
                     "duplicate",
@@ -999,193 +1287,46 @@ class TestInputValidation:
                 context_window=3,
             )
 
-    def test_invalid_forecast_horizon_is_rejected(self):
-        """TargetDataset rejects non-positive forecast horizons."""
+    def test_empty_feature_names_are_rejected(self):
+        """A SequenceDataset requires at least one feature."""
 
         with pytest.raises(ValueError):
-            TargetDataset(
-                targets=np.array([0.1]),
-                timestamps=[1.0],
-                target_name=TARGET_NAME,
-                forecast_horizon=0,
-            )
-
-    def test_invalid_target_name_is_rejected(self):
-        """TargetDataset requires a non-empty target name."""
-
-        with pytest.raises(ValueError):
-            TargetDataset(
-                targets=np.array([0.1]),
-                timestamps=[1.0],
-                target_name="",
-                forecast_horizon=5,
-            )
-
-    def test_invalid_price_column_is_rejected(self):
-        """TargetDataset requires a non-empty price column name."""
-
-        with pytest.raises(ValueError):
-            TargetDataset(
-                targets=np.array([0.1]),
-                timestamps=[1.0],
-                target_name=TARGET_NAME,
-                forecast_horizon=5,
-                price_column="",
+            SequenceDataset(
+                sequences=np.ones(
+                    (
+                        2,
+                        3,
+                        0,
+                    ),
+                    dtype=np.float64,
+                ),
+                timestamps=[
+                    [
+                        1.0,
+                        2.0,
+                        3.0,
+                    ],
+                    [
+                        2.0,
+                        3.0,
+                        4.0,
+                    ],
+                ],
+                feature_names=[],
+                context_window=3,
             )
 
 
-# ---------------------------------------------------------------------------
-# Sequence dimension validation
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Source Immutability and Determinism
+# =============================================================================
 
 
-class TestSequenceDimensions:
-    """Tests for sequence dimensionality and context preservation."""
-
-    @pytest.mark.parametrize(
-        "context_window",
-        [1, 2, 5, 10, 20, 25],
-    )
-    def test_multiple_context_windows(
-        self,
-        context_window: int,
-    ):
-        """Different valid context windows align correctly."""
-
-        num_rows = context_window + 10
-
-        dataset = make_forecasting_dataset(
-            num_rows=num_rows,
-            context_window=context_window,
-        )
-
-        expected_sequences = (
-            num_rows - context_window + 1
-        )
-
-        assert dataset.num_samples == expected_sequences
-        assert dataset.context_window == context_window
-        assert dataset.sequences.shape == (
-            expected_sequences,
-            context_window,
-            len(FEATURE_NAMES),
-        )
-
-    def test_context_window_one(self):
-        """A single-timestep context remains a valid model input."""
-
-        dataset = make_forecasting_dataset(
-            num_rows=10,
-            context_window=1,
-        )
-
-        assert dataset.sequences.shape == (
-            10,
-            1,
-            len(FEATURE_NAMES),
-        )
-
-    def test_context_window_equals_input_length(self):
-        """One complete sequence is produced when lengths are equal."""
-
-        dataset = make_forecasting_dataset(
-            num_rows=20,
-            context_window=20,
-        )
-
-        assert dataset.num_samples == 1
-        assert dataset.sequences.shape == (
-            1,
-            20,
-            len(FEATURE_NAMES),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Copy behavior
-# ---------------------------------------------------------------------------
-
-
-class TestCopyBehavior:
-    """Tests for output array independence."""
-
-    def test_copy_enabled_produces_independent_sequence_array(self):
-        """Default behavior returns independent sequence storage."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-            config=ForecastingDatasetConfig(
-                copy_arrays=True,
-            ),
-        )
-
-        original_first_value = dataset.sequences[0, 0, 0]
-
-        sequences.sequences[0, 0, 0] = 999999.0
-
-        assert dataset.sequences[0, 0, 0] == pytest.approx(
-            original_first_value
-        )
-
-    def test_copy_enabled_produces_independent_target_array(self):
-        """Default behavior returns independent target storage."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-            config=ForecastingDatasetConfig(
-                copy_arrays=True,
-            ),
-        )
-
-        original_first_target = dataset.targets[0]
-
-        targets.targets[19] = 999999.0
-
-        assert dataset.targets[0] == pytest.approx(
-            original_first_target
-        )
-
-    def test_copy_enabled_produces_independent_timestamp_array(self):
-        """Default behavior returns independent timestamp storage."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-            config=ForecastingDatasetConfig(
-                copy_arrays=True,
-            ),
-        )
-
-        original_first_timestamp = dataset.timestamps[0]
-
-        targets.timestamps[19] = 999999.0
-
-        assert dataset.timestamps[0] == pytest.approx(
-            original_first_timestamp
-        )
-
-
-# ---------------------------------------------------------------------------
-# Determinism
-# ---------------------------------------------------------------------------
-
-
-class TestDeterminism:
-    """Tests for deterministic forecasting dataset construction."""
+class TestImmutabilityAndDeterminism:
+    """Validate deterministic and non-destructive alignment."""
 
     def test_repeated_builds_are_identical(self):
-        """Repeated builds from identical inputs produce identical data."""
+        """Repeated builds produce exactly the same arrays."""
 
         sequences = make_sequence_dataset()
         targets = make_target_dataset()
@@ -1215,358 +1356,176 @@ class TestDeterminism:
             second.timestamps,
         )
 
-        assert first.feature_names == second.feature_names
-        assert first.context_window == second.context_window
-        assert first.forecast_horizon == second.forecast_horizon
-        assert first.target_name == second.target_name
-        assert first.price_column == second.price_column
-
-    def test_alignment_is_independent_of_target_order_when_contract_allows(
-        self,
-    ):
-        """
-        TargetDataset requires chronological timestamps, so target order
-        cannot be arbitrarily shuffled at construction time.
-
-        This test instead verifies that the builder's lookup is based on
-        timestamp identity rather than assuming a target index equals a
-        sequence index.
-        """
-
-        sequences = make_sequence_dataset(
-            num_rows=40,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=40,
-            target_offset=5.0,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        for timestamp, target in zip(
-            dataset.timestamps,
-            dataset.targets,
-        ):
-            expected = (
-                (timestamp - 1000.0) * 0.001
-                + 5.0
-            )
-
-            assert target == pytest.approx(expected)
-
-
-# ---------------------------------------------------------------------------
-# Convenience functions
-# ---------------------------------------------------------------------------
-
-
-class TestConvenienceFunctions:
-    """Tests for public convenience APIs."""
-
-    def test_build_forecasting_dataset_function(self):
-        """The convenience builder returns a valid dataset."""
+    def test_source_sequence_values_are_not_modified(self):
+        """Building the dataset does not mutate source sequences."""
 
         sequences = make_sequence_dataset()
-        targets = make_target_dataset()
 
-        dataset = build_forecasting_dataset(
+        before = sequences.sequences.copy()
+
+        build_forecasting_dataset(
             sequences,
-            targets,
-        )
-
-        assert isinstance(
-            dataset,
-            ForecastingDataset,
-        )
-
-    def test_align_sequence_targets_function(self):
-        """The alignment convenience function returns a valid dataset."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = align_sequence_targets(
-            sequences,
-            targets,
-        )
-
-        assert isinstance(
-            dataset,
-            ForecastingDataset,
-        )
-
-    def test_builder_class_matches_convenience_function(self):
-        """Builder class and convenience function produce equivalent data."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        builder = ForecastingDatasetBuilder()
-
-        from_builder = builder.build(
-            sequences,
-            targets,
-        )
-
-        from_function = build_forecasting_dataset(
-            sequences,
-            targets,
+            make_target_dataset(),
         )
 
         np.testing.assert_array_equal(
-            from_builder.sequences,
-            from_function.sequences,
-        )
-
-        np.testing.assert_array_equal(
-            from_builder.targets,
-            from_function.targets,
-        )
-
-        np.testing.assert_array_equal(
-            from_builder.timestamps,
-            from_function.timestamps,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestEdgeCases:
-    """Tests for small and unusual but valid forecasting datasets."""
-
-    def test_single_aligned_sequence(self):
-        """A dataset containing one aligned sample is valid."""
-
-        sequences = make_sequence_dataset(
-            num_rows=20,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=20,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert dataset.num_samples == 1
-        assert dataset.targets.shape == (1,)
-        assert dataset.timestamps.shape == (1,)
-
-    def test_extra_targets_do_not_create_extra_samples(self):
-        """Targets without corresponding sequence endpoints are ignored."""
-
-        sequences = make_sequence_dataset(
-            num_rows=20,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=100,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert dataset.num_samples == 1
-
-    def test_extra_sequences_are_dropped_when_targets_end_early(self):
-        """Sequences without future target entries are not fabricated."""
-
-        sequences = make_sequence_dataset(
-            num_rows=100,
-            context_window=20,
-        )
-
-        targets = make_target_dataset(
-            num_rows=30,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert np.all(
-            dataset.timestamps
-            <= targets.timestamps[-1]
-        )
-
-    def test_custom_timestamp_step(self):
-        """Alignment works with non-unit timestamp spacing."""
-
-        sequences = make_sequence_dataset(
-            num_rows=30,
-            context_window=10,
-            timestamp_step=0.5,
-        )
-
-        targets = make_target_dataset(
-            num_rows=30,
-            timestamp_step=0.5,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert dataset.timestamps[0] == pytest.approx(
-            1004.5
-        )
-
-        assert dataset.timestamps[1] == pytest.approx(
-            1005.0
-        )
-
-    def test_large_context_window_preserves_shape(self):
-        """Large context windows remain model-compatible."""
-
-        dataset = make_forecasting_dataset(
-            num_rows=100,
-            context_window=50,
-        )
-
-        assert dataset.sequences.shape == (
-            51,
-            50,
-            len(FEATURE_NAMES),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Target immutability / preservation
-# ---------------------------------------------------------------------------
-
-
-class TestTargetPreservation:
-    """Tests that target values are not modified during alignment."""
-
-    def test_target_values_are_preserved_exactly(self):
-        """Alignment does not alter target values."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        expected = np.asarray(
-            targets.targets[19:],
-            dtype=np.float64,
-        )
-
-        np.testing.assert_array_equal(
-            dataset.targets,
-            expected,
-        )
-
-    def test_targets_are_not_normalized(self):
-        """
-        Alignment must preserve raw target values.
-
-        Target normalization, if ever introduced, belongs to a separate
-        explicitly defined pipeline stage.
-        """
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset(
-            target_offset=100.0,
-        )
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        assert np.all(
-            dataset.targets > 100.0
-        )
-
-
-# ---------------------------------------------------------------------------
-# Feature preservation
-# ---------------------------------------------------------------------------
-
-
-class TestFeaturePreservation:
-    """Tests that sequence feature values survive alignment unchanged."""
-
-    def test_feature_values_are_preserved(self):
-        """Aligned sequences contain the original feature values."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
-
-        np.testing.assert_array_equal(
-            dataset.sequences,
             sequences.sequences,
+            before,
         )
 
-    def test_feature_order_is_preserved(self):
-        """Feature order remains exactly the NVIDIA feature contract order."""
+    def test_source_target_values_are_not_modified(self):
+        """Building the dataset does not mutate source targets."""
 
-        sequences = make_sequence_dataset()
         targets = make_target_dataset()
 
-        dataset = build_forecasting_dataset(
-            sequences,
-            targets,
-        )
+        before = targets.targets.copy()
 
-        assert dataset.feature_names == FEATURE_NAMES
-
-    def test_context_values_are_preserved(self):
-        """The complete context window is retained for every sample."""
-
-        sequences = make_sequence_dataset()
-        targets = make_target_dataset()
-
-        dataset = build_forecasting_dataset(
-            sequences,
+        build_forecasting_dataset(
+            make_sequence_dataset(),
             targets,
         )
 
         np.testing.assert_array_equal(
-            dataset.sequences[0],
-            sequences.sequences[0],
+            targets.targets,
+            before,
+        )
+
+    def test_source_target_timestamps_are_not_modified(self):
+        """Building the dataset does not mutate target timestamps."""
+
+        targets = make_target_dataset()
+
+        before = np.asarray(
+            targets.timestamps
+        ).copy()
+
+        build_forecasting_dataset(
+            make_sequence_dataset(),
+            targets,
         )
 
         np.testing.assert_array_equal(
-            dataset.sequences[-1],
-            sequences.sequences[-1],
+            targets.timestamps,
+            before,
         )
 
+    def test_copy_arrays_true_separates_sequence_storage(self):
+        """Default copied arrays are independent of source storage."""
 
-# ---------------------------------------------------------------------------
-# Output integrity
-# ---------------------------------------------------------------------------
+        sequences = make_sequence_dataset()
+
+        dataset = build_forecasting_dataset(
+            sequences,
+            make_target_dataset(),
+            config=ForecastingDatasetConfig(
+                copy_arrays=True,
+            ),
+        )
+
+        original = dataset.sequences[
+            0,
+            0,
+            0,
+        ]
+
+        sequences.sequences[
+            0,
+            0,
+            0,
+        ] = 999999.0
+
+        assert dataset.sequences[
+            0,
+            0,
+            0,
+        ] == original
+
+    def test_copy_arrays_true_separates_target_storage(self):
+        """Default copied target arrays are independent of source storage."""
+
+        targets = make_target_dataset()
+
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            targets,
+            config=ForecastingDatasetConfig(
+                copy_arrays=True,
+            ),
+        )
+
+        original = dataset.targets[0]
+
+        targets.targets[19] = 999999.0
+
+        assert dataset.targets[0] == original
+
+
+# =============================================================================
+# Output Integrity
+# =============================================================================
 
 
 class TestOutputIntegrity:
-    """Tests for final ForecastingDataset invariants."""
+    """Validate final aligned-array invariants."""
 
-    def test_no_nan_features(self):
-        """Final feature sequences contain no NaN values."""
+    def test_features_are_finite(self):
+        """All feature values are finite."""
+
+        dataset = make_forecasting_dataset()
+
+        assert np.isfinite(
+            dataset.sequences
+        ).all()
+
+    def test_targets_are_finite(self):
+        """All target values are finite."""
+
+        dataset = make_forecasting_dataset()
+
+        assert np.isfinite(
+            dataset.targets
+        ).all()
+
+    def test_timestamps_are_finite(self):
+        """All timestamps are finite."""
+
+        dataset = make_forecasting_dataset()
+
+        assert np.isfinite(
+            dataset.timestamps
+        ).all()
+
+    def test_sample_counts_match(self):
+        """Every sample has one target and one timestamp."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.num_samples == len(
+            dataset.targets
+        ) == len(
+            dataset.timestamps
+        )
+
+    def test_feature_dimension_matches_metadata(self):
+        """The tensor feature dimension matches feature_names."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.sequences.shape[2] == (
+            len(dataset.feature_names)
+        )
+
+    def test_context_dimension_matches_metadata(self):
+        """The tensor context dimension matches context_window."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.sequences.shape[1] == (
+            dataset.context_window
+        )
+
+    def test_no_nan_values_anywhere(self):
+        """The final dataset contains no NaN values."""
 
         dataset = make_forecasting_dataset()
 
@@ -1574,8 +1533,16 @@ class TestOutputIntegrity:
             dataset.sequences
         ).any()
 
-    def test_no_infinite_features(self):
-        """Final feature sequences contain no infinite values."""
+        assert not np.isnan(
+            dataset.targets
+        ).any()
+
+        assert not np.isnan(
+            dataset.timestamps
+        ).any()
+
+    def test_no_infinite_values_anywhere(self):
+        """The final dataset contains no infinite values."""
 
         dataset = make_forecasting_dataset()
 
@@ -1583,168 +1550,93 @@ class TestOutputIntegrity:
             dataset.sequences
         ).any()
 
-    def test_no_nan_targets(self):
-        """Final targets contain no NaN values."""
-
-        dataset = make_forecasting_dataset()
-
-        assert not np.isnan(
-            dataset.targets
-        ).any()
-
-    def test_no_infinite_targets(self):
-        """Final targets contain no infinite values."""
-
-        dataset = make_forecasting_dataset()
-
         assert not np.isinf(
             dataset.targets
         ).any()
-
-    def test_no_nan_timestamps(self):
-        """Final timestamps contain no NaN values."""
-
-        dataset = make_forecasting_dataset()
-
-        assert not np.isnan(
-            dataset.timestamps
-        ).any()
-
-    def test_no_infinite_timestamps(self):
-        """Final timestamps contain no infinite values."""
-
-        dataset = make_forecasting_dataset()
 
         assert not np.isinf(
             dataset.timestamps
         ).any()
 
-    def test_every_sample_has_exactly_one_target(self):
-        """Sample alignment is one input sequence to one target."""
 
-        dataset = make_forecasting_dataset()
-
-        assert dataset.num_samples == len(
-            dataset.targets
-        )
-
-    def test_every_sample_has_exactly_one_timestamp(self):
-        """Sample alignment is one input sequence to one timestamp."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.num_samples == len(
-            dataset.timestamps
-        )
-
-
-# ---------------------------------------------------------------------------
-# Contract-level regression tests
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Forecasting Contract Regression
+# =============================================================================
 
 
 class TestForecastingContractRegression:
     """
-    Regression tests for the project's current NVIDIA forecasting contract.
+    Lock the canonical Phase 8/9 NVIDIA-facing data contract.
 
     Current contract:
 
-        20 timestep context window
-        14 input features
-        5 step forecast horizon
-        future_mid_price_return target
+        context_window = 20
+        num_features = 14
+        forecast_horizon = 5
+        target_name = future_mid_price_return
+        price_column = mid_price
     """
 
-    def test_nvidia_context_window(self):
-        """Current NVIDIA context window remains 20."""
+    def test_context_window_is_20(self):
+        """The canonical context window remains 20."""
 
-        dataset = make_forecasting_dataset()
+        assert make_forecasting_dataset().context_window == 20
 
-        assert dataset.context_window == 20
+    def test_feature_count_is_14(self):
+        """The canonical feature count remains 14."""
 
-    def test_nvidia_feature_count(self):
-        """Current NVIDIA input contains 14 features."""
+        assert make_forecasting_dataset().num_features == 14
 
-        dataset = make_forecasting_dataset()
+    def test_forecast_horizon_is_5(self):
+        """The canonical forecast horizon remains 5."""
 
-        assert dataset.num_features == 14
+        assert make_forecasting_dataset().forecast_horizon == 5
 
-    def test_nvidia_input_shape(self):
-        """Current NVIDIA model input contract is (N, 20, 14)."""
+    def test_target_name_is_future_mid_price_return(self):
+        """The canonical target name remains unchanged."""
 
-        dataset = make_forecasting_dataset()
+        assert (
+            make_forecasting_dataset().target_name
+            == "future_mid_price_return"
+        )
+
+    def test_price_column_is_mid_price(self):
+        """The canonical target source column remains mid_price."""
+
+        assert (
+            make_forecasting_dataset().price_column
+            == "mid_price"
+        )
+
+    def test_single_model_input_is_20_by_14(self):
+        """A single NVIDIA model input is exactly (20, 14)."""
+
+        assert (
+            make_forecasting_dataset().model_input_shape
+            == (20, 14)
+        )
+
+    def test_model_batch_is_n_by_20_by_14(self):
+        """A complete NVIDIA batch is (N, 20, 14)."""
+
+        dataset = make_forecasting_dataset(
+            num_rows=100,
+        )
 
         assert dataset.shape[1:] == (
             20,
             14,
         )
 
-    def test_nvidia_single_input_shape(self):
-        """One NVIDIA model input has shape (20, 14)."""
 
-        dataset = make_forecasting_dataset()
-
-        assert dataset.input_shape == (
-            20,
-            14,
-        )
-
-    def test_nvidia_target_shape(self):
-        """Current NVIDIA target contract is (N,)."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.targets.shape == (
-            dataset.num_samples,
-        )
-
-    def test_nvidia_forecast_horizon(self):
-        """Current NVIDIA forecast horizon remains five observations."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.forecast_horizon == 5
-
-    def test_nvidia_target_name(self):
-        """Current NVIDIA target name remains unchanged."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.target_name == (
-            "future_mid_price_return"
-        )
-
-    def test_nvidia_feature_order(self):
-        """Current NVIDIA feature ordering remains unchanged."""
-
-        dataset = make_forecasting_dataset()
-
-        assert dataset.feature_names == (
-            "mid_price_return",
-            "spread_bps",
-            "best_bid_size",
-            "best_ask_size",
-            "depth_imbalance_l1",
-            "depth_imbalance_multilevel",
-            "ofi_instant",
-            "ofi_sum_5",
-            "trade_volume_imbalance",
-            "momentum_ret_5",
-            "momentum_ret_20",
-            "volatility_std_10",
-            "micro_price",
-            "micro_price_divergence",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Final integration test
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Complete Pipeline Regression
+# =============================================================================
 
 
 def test_complete_forecasting_dataset_pipeline_contract():
     """
-    Verify the complete Phase 8 forecasting dataset contract in one test.
+    Validate the complete Phase 8/9 forecasting dataset contract.
 
     The resulting object must provide:
 
@@ -1774,7 +1666,7 @@ def test_complete_forecasting_dataset_pipeline_contract():
     assert dataset.targets.ndim == 1
     assert dataset.timestamps.ndim == 1
 
-    assert dataset.sequences.shape[1:] == (
+    assert dataset.shape[1:] == (
         20,
         14,
     )
@@ -1795,23 +1687,108 @@ def test_complete_forecasting_dataset_pipeline_contract():
     assert dataset.feature_names == FEATURE_NAMES
     assert dataset.context_window == 20
     assert dataset.forecast_horizon == 5
-    assert dataset.target_name == (
-        "future_mid_price_return"
-    )
+    assert dataset.target_name == TARGET_NAME
+    assert dataset.price_column == PRICE_COLUMN
 
     assert np.all(
         np.diff(dataset.timestamps) > 0
     )
 
-    assert np.all(
-        np.isfinite(dataset.sequences)
-    )
+    assert np.isfinite(
+        dataset.sequences
+    ).all()
 
-    assert np.all(
-        np.isfinite(dataset.targets)
-    )
+    assert np.isfinite(
+        dataset.targets
+    ).all()
 
-    assert np.all(
-        np.isfinite(dataset.timestamps)
-    )
+    assert np.isfinite(
+        dataset.timestamps
+    ).all()
+
+
+# =============================================================================
+# Convenience API Regression
+# =============================================================================
+
+
+class TestConvenienceAPIs:
+    """Validate public convenience APIs against the builder."""
+
+    def test_build_function_returns_forecasting_dataset(self):
+        """build_forecasting_dataset returns the expected contract."""
+
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            make_target_dataset(),
+        )
+
+        assert isinstance(
+            dataset,
+            ForecastingDataset,
+        )
+
+    def test_align_sequence_targets_matches_build_function(self):
+        """align_sequence_targets matches the main builder API."""
+
+        sequences = make_sequence_dataset()
+        targets = make_target_dataset()
+
+        first = build_forecasting_dataset(
+            sequences,
+            targets,
+        )
+
+        second = align_sequence_targets(
+            sequences,
+            targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.sequences,
+            second.sequences,
+        )
+
+        np.testing.assert_array_equal(
+            first.targets,
+            second.targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.timestamps,
+            second.timestamps,
+        )
+
+    def test_builder_matches_convenience_function(self):
+        """Builder and convenience function produce identical results."""
+
+        sequences = make_sequence_dataset()
+        targets = make_target_dataset()
+
+        builder = ForecastingDatasetBuilder()
+
+        first = builder.build(
+            sequences,
+            targets,
+        )
+
+        second = build_forecasting_dataset(
+            sequences,
+            targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.sequences,
+            second.sequences,
+        )
+
+        np.testing.assert_array_equal(
+            first.targets,
+            second.targets,
+        )
+
+        np.testing.assert_array_equal(
+            first.timestamps,
+            second.timestamps,
+        )
 
