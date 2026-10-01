@@ -134,3 +134,65 @@ def test_dashboard_refresh_returns_feature_history():
     assert snapshot.market is not None
     assert snapshot.features is not None
     assert snapshot.features.points[-1].timestamp == snapshot.market.timestamp
+
+
+def test_dashboard_risk_sections_populated():
+    """Verify risk data is populated from execution trajectory."""
+    response = client.get("/api/v1/dashboard/snapshot")
+    assert response.status_code == 200
+    snapshot = DashboardSnapshot.model_validate(response.json())
+
+    # Risk section should be populated (not null) since trajectory now carries adverse_risk_probability
+    assert snapshot.risk is not None, "risk section should not be null after bug fix"
+
+    risk = snapshot.risk
+    # Bounded probability
+    assert 0.0 <= risk.adverse_selection_probability <= 1.0
+    # Prediction horizon unit is ticks
+    assert risk.prediction_horizon_unit == "ticks"
+    # History should have entries
+    assert len(risk.history) > 0, "risk history should have entries"
+    # Every history probability in [0, 1]
+    for hp in risk.history:
+        assert 0.0 <= hp.adverse_selection_probability <= 1.0
+    # fill_probability is None (not computed by backend)
+    assert risk.fill_probability is None
+
+
+def test_dashboard_ac_schedule_populated():
+    """Verify AC schedule data is populated from Almgren-Chriss model."""
+    response = client.get("/api/v1/dashboard/snapshot")
+    assert response.status_code == 200
+    snapshot = DashboardSnapshot.model_validate(response.json())
+
+    ac = snapshot.ac_schedule
+    assert ac is not None, "ac_schedule should not be None"
+
+    points = ac.points
+    # Points should be in increasing elapsed_sec
+    elapsed_secs = [p.elapsed_sec for p in points]
+    assert elapsed_secs == sorted(elapsed_secs), "points should be in increasing elapsed_sec"
+
+    # First planned_remaining_quantity ≈ total_quantity
+    assert abs(points[0].planned_remaining_quantity - ac.total_quantity) / ac.total_quantity < 0.1
+
+    # Last planned_remaining_quantity ≈ 0
+    assert abs(points[-1].planned_remaining_quantity) < 0.1 * ac.total_quantity
+
+    # Sum of planned_slice_quantity ≈ total_quantity (abs tol 1e-2)
+    total_slice_qty = sum(p.planned_slice_quantity for p in points)
+    assert abs(total_slice_qty - ac.total_quantity) <= 1e-2, (
+        f"sum of slice quantities {total_slice_qty} not within tol 1e-2 of total_quantity {ac.total_quantity}"
+    )
+
+    # expected_cost >= 0
+    assert ac.expected_cost >= 0
+
+
+def test_dashboard_json_round_trip():
+    """Verify GET /api/v1/dashboard/snapshot returns 200 and contains keys 'risk' and 'ac_schedule'."""
+    response = client.get("/api/v1/dashboard/snapshot")
+    assert response.status_code == 200
+    data = response.json()
+    assert "risk" in data, "response should contain 'risk' key"
+    assert "ac_schedule" in data, "response should contain 'ac_schedule' key"

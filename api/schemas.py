@@ -64,13 +64,41 @@ class ExecutionState(BaseModel):
     trajectory: List[ExecutionPoint]
 
 
+class RiskPoint(BaseModel):
+    timestamp: str  # UTC ISO 8601
+    adverse_selection_probability: float
+    model_status: str
+
+
 class RiskState(BaseModel):
     timestamp: str
     adverse_selection_probability: float
-    fill_probability: float
-    prediction_horizon_ms: int
+    fill_probability: Optional[float] = None
+    prediction_horizon_ms: Optional[int] = None
     expected_market_impact_bps: Optional[float] = None
     expected_shortfall_bps: Optional[float] = None
+    model_status: str = ""
+    model_name: str = ""
+    prediction_horizon: int = 10
+    prediction_horizon_unit: Literal["ticks"] = "ticks"
+    history: List[RiskPoint] = []
+
+
+class ACSchedulePoint(BaseModel):
+    elapsed_sec: float
+    planned_remaining_quantity: float
+    planned_slice_quantity: float
+
+
+class ACScheduleState(BaseModel):
+    total_quantity: float
+    horizon_sec: float
+    num_slices: int
+    expected_cost: float
+    cost_variance: float
+    utility_cost: float
+    cost_unit: Literal["USD"] = "USD"
+    points: List[ACSchedulePoint]
 
 
 class StrategyResult(BaseModel):
@@ -95,6 +123,7 @@ class DashboardSnapshot(BaseModel):
     features: Optional[FeatureState] = None
     execution: Optional[ExecutionState] = None
     risk: Optional[RiskState] = None
+    ac_schedule: Optional[ACScheduleState] = None
     performance: Optional[PerformanceState] = None
 
 

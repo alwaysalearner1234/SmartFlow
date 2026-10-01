@@ -143,7 +143,7 @@ class ExecutionSimulator:
                 last_decision_time = snap.timestamp
 
                 # Record trajectory point — include execution context fields
-                ctx = decision.__dict__.get("execution_context")
+                ctx = self.strategy_engine.last_context
                 if ctx is not None and hasattr(ctx, 'has_valid_forecast'):
                     trajectory.append({
                         "timestamp": snap.timestamp,
@@ -155,7 +155,6 @@ class ExecutionSimulator:
                         "decision_quantity": decision.quantity,
                         "execution_mode": decision.execution_mode.value,
                         "cancel_active_orders": decision.cancel_active_orders,
-                        "urgency": decision.urgency,
                         "risk_score": decision.risk_score,
                         "reason": decision.reason,
                         "adverse_risk_probability": ctx.adverse_risk.probability,
