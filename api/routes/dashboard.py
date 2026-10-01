@@ -26,12 +26,16 @@ from api.schemas import (
     ExecutionState,
     ExecutionPoint,
     RiskState,
+    RiskPoint,
     PerformanceState,
     StrategyResult,
     Action,
     Strategy,
     HealthResponse,
+    ACSchedulePoint,
+    ACScheduleState,
 )
+from config.config import DEFAULT_CONFIG
 
 router = APIRouter(prefix="/api/v1", tags=["Dashboard"])
 
@@ -140,13 +144,6 @@ class DashboardDataService:
             ]
         )
 
-        # 2. Risk State
-        # Note: FillModel does not currently expose a dashboard fill_probability estimator,
-        # and PredictionResult.prediction_horizon is measured in ticks (not milliseconds).
-        # Per contract instructions, we do not fabricate values or invent conversions;
-        # the risk section remains null.
-        risk_state: Optional[RiskState] = None
-
         # 3. Execution Simulation via ExecutionSimulator
         exec_res: ExecutionResult = self.simulator.run_execution(
             strategy_name="Proposed (ML + AC)",
@@ -155,6 +152,77 @@ class DashboardDataService:
             horizon_sec=horizon_sec,
             side=side,
         )
+
+        # Build AC schedule using AlmgrenChrissModel
+        from execution.almgren_chriss import AlmgrenChrissModel
+
+        ac_num_slices = DEFAULT_CONFIG.execution.ac_num_slices or 12
+        ac_model = AlmgrenChrissModel()
+        sched = ac_model.generate_schedule(
+            total_quantity=order_size,
+            horizon_sec=horizon_sec,
+            num_slices=ac_num_slices,
+            initial_price=snapshots[0].mid_price,
+        )
+
+        # Map schedule to AC schedule points
+        # holdings has ac_num_slices+1 entries, trade_sizes has ac_num_slices entries
+        ac_points = []
+        for i in range(ac_num_slices + 1):
+            if i < ac_num_slices:
+                slice_qty = float(sched.trade_sizes[i])
+            else:
+                slice_qty = 0.0
+            ac_points.append(
+                ACSchedulePoint(
+                    elapsed_sec=float(sched.time_intervals[i]),
+                    planned_remaining_quantity=float(sched.holdings[i]),
+                    planned_slice_quantity=slice_qty,
+                )
+            )
+
+        ac_schedule = ACScheduleState(
+            total_quantity=float(order_size),
+            horizon_sec=float(horizon_sec),
+            num_slices=ac_num_slices,
+            expected_cost=round(float(sched.expected_cost), 4),
+            cost_variance=round(float(sched.cost_variance), 4),
+            utility_cost=round(float(sched.utility_cost), 4),
+            points=ac_points,
+        )
+
+        # Build risk state from execution trajectory points that contain adverse risk data
+        risk_points = []
+        for pt in exec_res.trajectory:
+            if "adverse_risk_probability" in pt:
+                model_status_val = pt.get("adverse_risk_model_status")
+                if hasattr(model_status_val, "value"):
+                    model_status_str = model_status_val.value
+                else:
+                    model_status_str = str(model_status_val) if model_status_val else ""
+                risk_points.append(
+                    RiskPoint(
+                        timestamp=_format_iso(float(pt["timestamp"])),
+                        adverse_selection_probability=pt["adverse_risk_probability"],
+                        model_status=model_status_str,
+                    )
+                )
+
+        if risk_points:
+            predictor = self.simulator.strategy_engine.predictor
+            risk_state = RiskState(
+                timestamp=_format_iso(
+                    float(exec_res.trajectory[-1]["timestamp"])
+                ),
+                adverse_selection_probability=risk_points[-1].adverse_selection_probability,
+                model_status=risk_points[-1].model_status,
+                model_name=predictor.model_name,
+                prediction_horizon=predictor.horizon,
+                prediction_horizon_unit="ticks",
+                history=risk_points,
+            )
+        else:
+            risk_state = None
 
         # Index actual fills by timestamp if available
         fills_by_ts: Dict[float, List[float]] = {}
@@ -252,6 +320,7 @@ class DashboardDataService:
             features=feature_state,
             execution=execution_state,
             risk=risk_state,
+            ac_schedule=ac_schedule,
             performance=perf_state,
         )
 
