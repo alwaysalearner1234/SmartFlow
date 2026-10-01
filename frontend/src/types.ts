@@ -57,10 +57,38 @@ export interface ExecutionState {
 export interface RiskState {
   timestamp: string;
   adverse_selection_probability: number; // [0, 1], post-fill adverse move
-  fill_probability: number; // [0, 1] for passive order at current quote
-  prediction_horizon_ms: number;
+  fill_probability: number | null; // unavailable until fill estimator is exposed
+  prediction_horizon_ms: number | null;
   expected_market_impact_bps: number | null;
   expected_shortfall_bps: number | null;
+  model_status: string;
+  model_name: string;
+  prediction_horizon: number;
+  prediction_horizon_unit: 'ticks';
+  history: RiskPoint[]; // oldest first
+}
+
+export interface RiskPoint {
+  timestamp: string;
+  adverse_selection_probability: number;
+  model_status: string;
+}
+
+export interface ACSchedulePoint {
+  elapsed_sec: number;
+  planned_remaining_quantity: number;
+  planned_slice_quantity: number;
+}
+
+export interface ACScheduleState {
+  total_quantity: number;
+  horizon_sec: number;
+  num_slices: number;
+  expected_cost: number; // quote currency, currently USD
+  cost_variance: number; // squared units; do not label as USD
+  utility_cost: number;
+  cost_unit: 'USD';
+  points: ACSchedulePoint[]; // last point closes schedule; slice quantity is zero
 }
 
 export interface StrategyResult {
@@ -85,5 +113,6 @@ export interface DashboardSnapshot {
   features?: FeatureState | null; // optional while older API deployments remain in use
   execution: ExecutionState | null;
   risk: RiskState | null;
+  ac_schedule?: ACScheduleState | null;
   performance: PerformanceState | null;
 }

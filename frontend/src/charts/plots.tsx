@@ -1,10 +1,24 @@
 import Plot from 'react-plotly.js';
-import type { ExecutionPoint, FeaturePoint, StrategyResult } from '../types';
+import type { ACSchedulePoint, ExecutionPoint, FeaturePoint, RiskPoint, StrategyResult } from '../types';
 
 const layout = { paper_bgcolor: 'transparent', plot_bgcolor: 'transparent', font: { color: '#c9d6e4' }, margin: { t: 20, r: 20, b: 45, l: 55 }, autosize: true };
 
 export function ExecutionTrajectory({ points }: { points: ExecutionPoint[] }) {
   return <Plot data={[{ x: points.map(p => p.timestamp), y: points.map(p => p.remaining_quantity), type: 'scatter', mode: 'lines+markers', name: 'Remaining quantity', line: { color: '#58c4a3' } }]} layout={{ ...layout, xaxis: { title: { text: 'Time' } }, yaxis: { title: { text: 'Quantity' } } }} useResizeHandler style={{ width: '100%', height: 280 }} config={{ displayModeBar: false }} />;
+}
+
+export function RiskHistoryChart({ points }: { points: RiskPoint[] }) {
+  return <Plot data={[{ x: points.map(p => p.timestamp), y: points.map(p => p.adverse_selection_probability * 100), type: 'scatter', mode: 'lines+markers', name: 'Adverse-selection risk', line: { color: '#fa6995' }, marker: { size: 5 } }]}
+    layout={{ ...layout, margin: { t: 10, r: 15, b: 45, l: 55 }, xaxis: { title: { text: 'Time' } }, yaxis: { title: { text: 'Probability (%)' }, range: [0, 100] }, showlegend: false }}
+    useResizeHandler style={{ width: '100%', height: 250 }} config={{ displayModeBar: false }} />;
+}
+
+export function ACScheduleChart({ points }: { points: ACSchedulePoint[] }) {
+  return <Plot data={[
+    { x: points.map(p => p.elapsed_sec), y: points.map(p => p.planned_remaining_quantity), type: 'scatter', mode: 'lines+markers', name: 'Planned remaining', line: { color: '#4dd6e6' } },
+    { x: points.slice(0, -1).map(p => p.elapsed_sec), y: points.slice(0, -1).map(p => p.planned_slice_quantity), type: 'bar', name: 'Planned slice', marker: { color: '#58c4a3' }, opacity: 0.5 },
+  ]} layout={{ ...layout, margin: { t: 10, r: 15, b: 45, l: 60 }, xaxis: { title: { text: 'Elapsed time (sec)' } }, yaxis: { title: { text: 'Quantity' } }, legend: { orientation: 'h', y: 1.2 }, barmode: 'overlay' }}
+    useResizeHandler style={{ width: '100%', height: 300 }} config={{ displayModeBar: false }} />;
 }
 
 export function StrategyComparison({ results }: { results: StrategyResult[] }) {
