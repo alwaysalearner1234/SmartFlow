@@ -5,6 +5,7 @@ import { OrderBook } from './components/OrderBook';
 import { MarketFeatures } from './components/MarketFeatures';
 import { Execution } from './components/Execution';
 import { Risk } from './components/Risk';
+import { ACSchedule } from './components/ACSchedule';
 import { Performance } from './components/Performance';
 
 export default function App() {
@@ -33,5 +34,5 @@ export default function App() {
     }
   }
 
-  return <main><header><div><span className="eyebrow">SMARTFLOW</span><h1>Execution dashboard</h1><p>Market context, execution decisions, risk, and backtest results.</p></div><div className="header-actions"><span className="status">{status}</span><button type="button" onClick={refreshSnapshot} disabled={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div></header><div className="grid"><OrderBook market={snapshot?.market ?? null} /><Execution execution={snapshot?.execution ?? null} /><MarketFeatures features={snapshot?.features ?? null} /><Risk risk={snapshot?.risk ?? null} /><Performance performance={snapshot?.performance ?? null} /></div></main>;
+  return <main><header><div><span className="eyebrow">SMARTFLOW</span><h1>Execution dashboard</h1><p>Market context, execution decisions, risk, and backtest results.</p></div><div className="header-actions"><span className="status">{status}</span><button type="button" onClick={refreshSnapshot} disabled={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div></header><div className="grid"><OrderBook market={snapshot?.market ?? null} /><Execution execution={snapshot?.execution ?? null} /><MarketFeatures features={snapshot?.features ?? null} /><Risk risk={snapshot?.risk ?? null} /><ACSchedule schedule={snapshot?.ac_schedule ?? null} /><Performance performance={snapshot?.performance ?? null} /></div></main>;
 }
