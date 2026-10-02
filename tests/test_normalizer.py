@@ -3306,6 +3306,207 @@ class TestNormalizerIdempotence:
         )
 
 
+
+# ---------------------------------------------------------------------------
+# Phase 10 timestamp-window preservation
+# ---------------------------------------------------------------------------
+
+
+class TestTimestampWindowPreservation:
+    """Regression tests for complete forecasting timestamp metadata."""
+
+    @staticmethod
+    def make_dataset_with_timestamp_windows(
+        *,
+        num_samples: int = 10,
+        context_window: int = CONTEXT_WINDOW,
+        timestamp_start: float = 1000.0,
+    ) -> ForecastingDataset:
+        """Create a dataset carrying one complete timestamp window per sample."""
+
+        dataset = make_dataset(
+            num_samples=num_samples,
+            context_window=context_window,
+            timestamp_start=timestamp_start,
+        )
+
+        windows = tuple(
+            tuple(
+                float(timestamp_start + sample_index - context_window + 1 + step)
+                for step in range(context_window)
+            )
+            for sample_index in range(num_samples)
+        )
+
+        return ForecastingDataset(
+            sequences=dataset.sequences,
+            targets=dataset.targets,
+            timestamps=dataset.timestamps,
+            feature_names=dataset.feature_names,
+            context_window=dataset.context_window,
+            forecast_horizon=dataset.forecast_horizon,
+            target_name=dataset.target_name,
+            price_column=dataset.price_column,
+            timestamp_windows=windows,
+        )
+
+    def test_transform_preserves_timestamp_windows(self):
+        """Normalization must preserve complete context timestamp windows."""
+
+        dataset = self.make_dataset_with_timestamp_windows()
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        assert transformed.has_timestamp_windows is True
+        assert transformed.timestamp_windows == dataset.timestamp_windows
+
+    def test_transform_preserves_each_timestamp_window_exactly(self):
+        """Every normalized sample retains its original timestamp window."""
+
+        dataset = self.make_dataset_with_timestamp_windows(
+            num_samples=6,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        assert len(transformed.timestamp_windows) == 6
+
+        for index in range(6):
+            assert transformed.get_timestamp_window(index) == (
+                dataset.get_timestamp_window(index)
+            )
+
+    def test_timestamp_windows_are_not_changed_by_normalization(self):
+        """Feature normalization must not alter timestamp metadata values."""
+
+        dataset = self.make_dataset_with_timestamp_windows(
+            num_samples=5,
+        )
+        original = tuple(dataset.timestamp_windows)
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        normalizer.transform(dataset)
+
+        assert dataset.timestamp_windows == original
+
+    def test_transform_splits_preserves_timestamp_windows(self):
+        """All train/validation/test timestamp windows survive normalization."""
+
+        training = self.make_dataset_with_timestamp_windows(
+            num_samples=10,
+            timestamp_start=1000.0,
+        )
+        validation = self.make_dataset_with_timestamp_windows(
+            num_samples=6,
+            timestamp_start=2000.0,
+        )
+        test = self.make_dataset_with_timestamp_windows(
+            num_samples=5,
+            timestamp_start=3000.0,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalized = normalizer.transform_splits(
+            training,
+            validation,
+            test,
+        )
+
+        for result, source in zip(normalized, (training, validation, test)):
+            assert result.has_timestamp_windows is True
+            assert result.timestamp_windows == source.timestamp_windows
+
+    def test_fit_transform_preserves_timestamp_windows(self):
+        """fit_transform preserves timestamp windows just like transform."""
+
+        dataset = self.make_dataset_with_timestamp_windows()
+
+        normalizer = ForecastingDatasetNormalizer()
+        transformed = normalizer.fit_transform(dataset)
+
+        assert transformed.timestamp_windows == dataset.timestamp_windows
+
+    def test_disabled_normalization_preserves_timestamp_windows(self):
+        """The disabled-normalization path also preserves timestamp windows."""
+
+        dataset = self.make_dataset_with_timestamp_windows()
+
+        normalizer = ForecastingDatasetNormalizer(
+            NormalizerConfig(
+                normalize_features=False,
+            )
+        )
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        assert transformed.timestamp_windows == dataset.timestamp_windows
+
+    def test_timestamp_window_count_matches_sample_count_after_transform(self):
+        """Normalization must preserve one timestamp window per sample."""
+
+        dataset = self.make_dataset_with_timestamp_windows(
+            num_samples=7,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        assert len(transformed.timestamp_windows) == transformed.num_samples
+
+    def test_timestamp_window_length_matches_context_after_transform(self):
+        """Each preserved timestamp window retains the 20-step context."""
+
+        dataset = self.make_dataset_with_timestamp_windows(
+            num_samples=7,
+            context_window=20,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        for window in transformed.timestamp_windows:
+            assert len(window) == 20
+
+    def test_timestamp_window_final_timestamp_matches_sample_timestamp(self):
+        """Preserved windows remain aligned with their sample timestamps."""
+
+        dataset = self.make_dataset_with_timestamp_windows(
+            num_samples=7,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        for index in range(transformed.num_samples):
+            window = transformed.get_timestamp_window(index)
+            assert window[-1] == transformed.timestamps[index]
+
+    def test_timestamp_windows_remain_chronological(self):
+        """Normalization must preserve chronological ordering inside windows."""
+
+        dataset = self.make_dataset_with_timestamp_windows(
+            num_samples=7,
+        )
+
+        normalizer = ForecastingDatasetNormalizer()
+        normalizer.fit(dataset)
+        transformed = normalizer.transform(dataset)
+
+        for window in transformed.timestamp_windows:
+            assert all(
+                left < right
+                for left, right in zip(window, window[1:])
+            )
+
+
 # ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------

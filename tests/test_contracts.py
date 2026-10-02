@@ -34,10 +34,12 @@ import pytest
 
 from data.contracts import (
     ForecastInput,
+    ForecastingDataset as ContractForecastingDataset,
     ForecastResult,
     ModelStatus,
     SequenceDataset,
     TargetDataset,
+    validate_forecasting_dataset_contract,
 )
 
 from data.forecasting_dataset import ForecastingDataset
@@ -155,7 +157,7 @@ def make_forecasting_dataset(
     context_window: int = CONTEXT_WINDOW,
     num_features: int = NUM_FEATURES,
 ) -> ForecastingDataset:
-    """Create a valid model-facing forecasting dataset."""
+    """Create a valid pipeline-layer forecasting dataset."""
     sequences = make_sequence_array(
         num_samples=num_samples,
         context_window=context_window,
@@ -1703,6 +1705,425 @@ class TestForecastingDatasetEnhanced:
         assert not np.array_equal(copied.timestamps, dataset.timestamps)
 
 
+
+# ===========================================================================
+# Phase 10 NVIDIA I/O Integration & Timestamp-Window Contract Tests
+# ===========================================================================
+
+
+def make_contract_forecasting_dataset(
+    *,
+    feature_names=None,
+    context_window: int = CONTEXT_WINDOW,
+    forecast_horizon: int = FORECAST_HORIZON,
+    include_timestamp_windows: bool = True,
+) -> ContractForecastingDataset:
+    """Create a canonical contract-layer ForecastingDataset for Phase 10 tests."""
+    if feature_names is None:
+        feature_names = tuple(FEATURE_NAMES)
+
+    timestamps = np.arange(
+        2_000.0,
+        2_000.0 + NUM_SAMPLES,
+        dtype=np.float64,
+    )
+
+    timestamp_windows = None
+    if include_timestamp_windows:
+        timestamp_windows = tuple(
+            tuple(
+                float(timestamp - context_window + offset + 1)
+                for offset in range(context_window)
+            )
+            for timestamp in timestamps
+        )
+
+    return ContractForecastingDataset(
+        sequences=make_sequence_array(
+            context_window=context_window,
+            num_features=len(feature_names),
+        ),
+        targets=make_target_values(),
+        timestamps=timestamps,
+        feature_names=tuple(feature_names),
+        context_window=context_window,
+        forecast_horizon=forecast_horizon,
+        target_name="future_mid_price_return",
+        price_column="mid_price",
+        timestamp_windows=timestamp_windows,
+    )
+
+
+class TestForecastingDatasetTimestampWindows:
+    """Tests for the complete context timestamp windows introduced in Phase 10."""
+
+    def make_dataset(self, **overrides):
+        """Build a valid contract-layer forecasting dataset."""
+        values = {
+            "sequences": make_sequence_array(),
+            "targets": make_target_values(),
+            "timestamps": np.arange(
+                2_000.0,
+                2_000.0 + NUM_SAMPLES,
+                dtype=np.float64,
+            ),
+            "feature_names": tuple(FEATURE_NAMES),
+            "context_window": CONTEXT_WINDOW,
+            "forecast_horizon": FORECAST_HORIZON,
+            "target_name": "future_mid_price_return",
+            "price_column": "mid_price",
+            "timestamp_windows": tuple(
+                tuple(
+                    float(timestamp - CONTEXT_WINDOW + offset + 1)
+                    for offset in range(CONTEXT_WINDOW)
+                )
+                for timestamp in np.arange(
+                    2_000.0,
+                    2_000.0 + NUM_SAMPLES,
+                    dtype=np.float64,
+                )
+            ),
+        }
+        values.update(overrides)
+        return ContractForecastingDataset(**values)
+
+    def test_timestamp_windows_are_available(self):
+        """A Phase 10 dataset should expose complete context timestamp windows."""
+        dataset = self.make_dataset()
+
+        assert dataset.has_timestamp_windows is True
+        assert dataset.timestamp_windows is not None
+        assert len(dataset.timestamp_windows) == NUM_SAMPLES
+        assert len(dataset.timestamp_windows[0]) == CONTEXT_WINDOW
+
+    def test_timestamp_windows_are_canonicalized_to_immutable_tuples(self):
+        """Stored timestamp windows should be stable tuple metadata."""
+        dataset = self.make_dataset()
+
+        assert isinstance(dataset.timestamp_windows, tuple)
+        assert all(
+            isinstance(window, tuple)
+            for window in dataset.timestamp_windows
+        )
+
+    def test_timestamp_window_ends_at_aligned_sample_timestamp(self):
+        """The final context timestamp must equal the aligned sample timestamp."""
+        dataset = self.make_dataset()
+
+        for index in range(NUM_SAMPLES):
+            window = dataset.get_timestamp_window(index)
+            assert window[-1] == pytest.approx(
+                float(dataset.timestamps[index])
+            )
+
+    def test_get_timestamp_window_returns_complete_context(self):
+        """A retrieved window must contain the full 20-row temporal context."""
+        dataset = self.make_dataset()
+
+        window = dataset.get_timestamp_window(3)
+
+        assert len(window) == CONTEXT_WINDOW
+        assert window == dataset.timestamp_windows[3]
+        assert np.all(np.diff(window) > 0)
+
+    def test_timestamp_window_count_must_match_samples(self):
+        """Every forecasting sample needs exactly one timestamp window."""
+        with pytest.raises(ValueError, match="exactly one window per sample"):
+            self.make_dataset(
+                timestamp_windows=(
+                    self.make_dataset().timestamp_windows[:-1]
+                )
+            )
+
+    def test_timestamp_window_length_must_match_context_window(self):
+        """Every timestamp window must contain exactly the context rows."""
+        windows = list(self.make_dataset().timestamp_windows)
+        windows[0] = windows[0][:-1]
+
+        with pytest.raises(ValueError, match="exactly"):
+            self.make_dataset(timestamp_windows=tuple(windows))
+
+    def test_timestamp_windows_must_be_chronological(self):
+        """Each context timestamp window must be strictly increasing."""
+        windows = [list(window) for window in self.make_dataset().timestamp_windows]
+        windows[0][7], windows[0][8] = windows[0][8], windows[0][7]
+
+        with pytest.raises(ValueError, match="chronological"):
+            self.make_dataset(
+                timestamp_windows=tuple(tuple(window) for window in windows)
+            )
+
+    def test_duplicate_timestamp_window_values_are_rejected(self):
+        """Duplicate timestamps inside a context window are invalid."""
+        windows = [list(window) for window in self.make_dataset().timestamp_windows]
+        windows[0][7] = windows[0][6]
+
+        with pytest.raises(ValueError, match="chronological|unique"):
+            self.make_dataset(
+                timestamp_windows=tuple(tuple(window) for window in windows)
+            )
+
+    @pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+    def test_nonfinite_timestamp_window_values_are_rejected(self, bad_value):
+        """NaN and infinite context timestamps must not reach model input."""
+        windows = [list(window) for window in self.make_dataset().timestamp_windows]
+        windows[0][5] = bad_value
+
+        with pytest.raises(ValueError, match="finite"):
+            self.make_dataset(
+                timestamp_windows=tuple(tuple(window) for window in windows)
+            )
+
+    def test_timestamp_window_final_value_must_match_aligned_timestamp(self):
+        """Context windows must align exactly with the dataset sample timestamp."""
+        windows = [list(window) for window in self.make_dataset().timestamp_windows]
+        windows[0][-1] += 1.0
+
+        with pytest.raises(ValueError, match="aligned|final"):
+            self.make_dataset(
+                timestamp_windows=tuple(tuple(window) for window in windows)
+            )
+
+    @pytest.mark.parametrize("index", [-1, NUM_SAMPLES])
+    def test_get_timestamp_window_rejects_out_of_range_index(self, index):
+        """Timestamp-window lookup must enforce sample bounds."""
+        dataset = self.make_dataset()
+
+        with pytest.raises(IndexError, match="out of range"):
+            dataset.get_timestamp_window(index)
+
+    def test_get_timestamp_window_rejects_non_integer_index(self):
+        """Timestamp-window lookup requires an integer index."""
+        dataset = self.make_dataset()
+
+        with pytest.raises(TypeError, match="index"):
+            dataset.get_timestamp_window("0")
+
+
+class TestForecastingDatasetToForecastInput:
+    """Tests for the final ForecastingDataset -> ForecastInput I/O contract."""
+
+    def test_to_forecast_input_preserves_complete_context(self):
+        """One dataset sample should convert losslessly into ForecastInput."""
+        dataset = make_contract_forecasting_dataset()
+
+        forecast_input = dataset.to_forecast_input(2)
+
+        assert isinstance(forecast_input, ForecastInput)
+        assert forecast_input.context_window == CONTEXT_WINDOW
+        assert forecast_input.forecast_horizon == FORECAST_HORIZON
+        assert forecast_input.shape == (CONTEXT_WINDOW, NUM_FEATURES)
+        assert forecast_input.feature_names == FEATURE_NAMES
+        assert forecast_input.timestamps == list(
+            dataset.get_timestamp_window(2)
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(forecast_input.feature_sequence, dtype=np.float64),
+            dataset.sequences[2],
+        )
+
+    def test_to_forecast_input_uses_the_matching_timestamp_window(self):
+        """The selected sample index must determine both data and timestamps."""
+        dataset = make_contract_forecasting_dataset()
+
+        first = dataset.to_forecast_input(0)
+        last = dataset.to_forecast_input(NUM_SAMPLES - 1)
+
+        assert first.timestamps != last.timestamps
+        assert first.timestamps[-1] == pytest.approx(2_000.0)
+        assert last.timestamps[-1] == pytest.approx(2_007.0)
+
+    def test_to_forecast_input_excludes_targets(self):
+        """Target values must never be embedded in inference input."""
+        dataset = make_contract_forecasting_dataset()
+
+        forecast_input = dataset.to_forecast_input(0)
+
+        assert not hasattr(forecast_input, "target")
+        assert not hasattr(forecast_input, "targets")
+
+        # The feature sequence must be exactly the stored sequence; targets
+        # are metadata and are not copied into the model input.
+        np.testing.assert_allclose(
+            np.asarray(forecast_input.feature_sequence, dtype=np.float64),
+            dataset.sequences[0],
+        )
+
+    def test_to_forecast_input_rejects_missing_timestamp_windows(self):
+        """Inference conversion must fail rather than invent missing timestamps."""
+        dataset = make_contract_forecasting_dataset(
+            include_timestamp_windows=False
+        )
+
+        assert dataset.has_timestamp_windows is False
+
+        with pytest.raises(ValueError, match="timestamp windows"):
+            dataset.to_forecast_input(0)
+
+    @pytest.mark.parametrize("index", [-1, NUM_SAMPLES])
+    def test_to_forecast_input_rejects_out_of_range_index(self, index):
+        """Model-input conversion must enforce dataset sample bounds."""
+        dataset = make_contract_forecasting_dataset()
+
+        with pytest.raises(IndexError, match="out of range"):
+            dataset.to_forecast_input(index)
+
+    def test_to_forecast_input_rejects_non_integer_index(self):
+        """Model-input conversion requires an integer sample index."""
+        dataset = make_contract_forecasting_dataset()
+
+        with pytest.raises(TypeError, match="index"):
+            dataset.to_forecast_input("0")
+
+
+class TestForecastingDatasetCopyWithTimestampWindows:
+    """Tests that dataset copying preserves the Phase 10 timestamp contract."""
+
+    def test_copy_preserves_timestamp_windows(self):
+        """Copying must retain the complete context timestamp history."""
+        dataset = make_contract_forecasting_dataset()
+        copied = dataset.copy()
+
+        assert copied is not dataset
+        assert copied.has_timestamp_windows is True
+        assert copied.timestamp_windows == dataset.timestamp_windows
+
+        for index in range(NUM_SAMPLES):
+            assert copied.get_timestamp_window(index) == (
+                dataset.get_timestamp_window(index)
+            )
+
+    def test_copy_does_not_share_mutable_timestamp_window_sources(self):
+        """Copy should detach from any caller-owned mutable timestamp containers."""
+        windows = [
+            [
+                float(timestamp - CONTEXT_WINDOW + offset + 1)
+                for offset in range(CONTEXT_WINDOW)
+            ]
+            for timestamp in np.arange(
+                2_000.0,
+                2_000.0 + NUM_SAMPLES,
+                dtype=np.float64,
+            )
+        ]
+
+        dataset = ContractForecastingDataset(
+            sequences=make_sequence_array(),
+            targets=make_target_values(),
+            timestamps=np.arange(
+                2_000.0,
+                2_000.0 + NUM_SAMPLES,
+                dtype=np.float64,
+            ),
+            feature_names=tuple(FEATURE_NAMES),
+            context_window=CONTEXT_WINDOW,
+            forecast_horizon=FORECAST_HORIZON,
+            target_name="future_mid_price_return",
+            price_column="mid_price",
+            timestamp_windows=windows,
+        )
+
+        copied = dataset.copy()
+
+        windows[0][0] = -999.0
+
+        assert copied.get_timestamp_window(0)[0] != -999.0
+        assert dataset.get_timestamp_window(0)[0] != -999.0
+
+
+class TestPhase10ContractIntegration:
+    """Cross-check the complete ForecastingDataset and NVIDIA I/O contract."""
+
+    def test_valid_final_dataset_passes_nvidia_contract_validation(self):
+        """A canonical Phase 10 dataset must satisfy the NVIDIA contract."""
+        dataset = make_contract_forecasting_dataset()
+
+        validate_forecasting_dataset_contract(dataset)
+
+    def test_final_dataset_and_forecast_input_share_exact_feature_order(self):
+        """Feature order must survive the dataset-to-input boundary unchanged."""
+        dataset = make_contract_forecasting_dataset()
+        forecast_input = dataset.to_forecast_input(4)
+
+        assert tuple(forecast_input.feature_names) == (
+            tuple(dataset.feature_names)
+        )
+
+    def test_final_dataset_and_forecast_input_share_exact_horizon(self):
+        """Dataset and model input must use the same forecasting horizon."""
+        dataset = make_contract_forecasting_dataset()
+        forecast_input = dataset.to_forecast_input(4)
+
+        assert forecast_input.forecast_horizon == dataset.forecast_horizon
+        assert forecast_input.forecast_horizon == FORECAST_HORIZON
+
+    def test_final_dataset_and_forecast_input_share_exact_context_window(self):
+        """Dataset and model input must use the same context length."""
+        dataset = make_contract_forecasting_dataset()
+        forecast_input = dataset.to_forecast_input(4)
+
+        assert forecast_input.context_window == dataset.context_window
+        assert forecast_input.context_window == CONTEXT_WINDOW
+
+    def test_each_forecast_input_timestamp_window_ends_at_sample_timestamp(self):
+        """Every generated ForecastInput must remain temporally aligned."""
+        dataset = make_contract_forecasting_dataset()
+
+        for index in range(dataset.num_samples):
+            forecast_input = dataset.to_forecast_input(index)
+
+            assert forecast_input.timestamps[-1] == pytest.approx(
+                float(dataset.timestamps[index])
+            )
+            assert np.all(
+                np.diff(
+                    np.asarray(forecast_input.timestamps, dtype=np.float64)
+                ) > 0
+            )
+
+    def test_targets_are_not_used_to_construct_forecast_input(self):
+        """Changing targets must not change the inference input."""
+        dataset = make_contract_forecasting_dataset()
+        first_input = dataset.to_forecast_input(3)
+
+        changed_targets = dataset.targets.copy()
+        changed_targets[3] += 123.456
+
+        changed_dataset = ContractForecastingDataset(
+            sequences=dataset.sequences.copy(),
+            targets=changed_targets,
+            timestamps=dataset.timestamps.copy(),
+            feature_names=dataset.feature_names,
+            context_window=dataset.context_window,
+            forecast_horizon=dataset.forecast_horizon,
+            target_name=dataset.target_name,
+            price_column=dataset.price_column,
+            timestamp_windows=dataset.timestamp_windows,
+        )
+        second_input = changed_dataset.to_forecast_input(3)
+
+        assert first_input.feature_sequence == second_input.feature_sequence
+        assert first_input.timestamps == second_input.timestamps
+        assert first_input.feature_names == second_input.feature_names
+        assert (
+            first_input.forecast_horizon
+            == second_input.forecast_horizon
+        )
+
+    def test_noncanonical_feature_order_fails_nvidia_contract_validation(self):
+        """The final contract validator must reject feature reordering."""
+        dataset = make_contract_forecasting_dataset(
+            feature_names=tuple(
+                [FEATURE_NAMES[1], FEATURE_NAMES[0]]
+                + FEATURE_NAMES[2:]
+            )
+        )
+
+        with pytest.raises(ValueError, match="contract mismatch"):
+            validate_forecasting_dataset_contract(dataset)
+
+
 class TestContractIntegrationEnhanced:
     """End-to-end compatibility checks across the forecasting contracts."""
 
@@ -1734,7 +2155,7 @@ class TestContractIntegrationEnhanced:
             target_name="future_mid_price_return",
             forecast_horizon=FORECAST_HORIZON,
         )
-        forecasting_dataset = ForecastingDataset(
+        forecasting_dataset = ContractForecastingDataset(
             sequences=make_sequence_array(),
             targets=make_target_values(),
             timestamps=np.arange(
@@ -1753,7 +2174,7 @@ class TestContractIntegrationEnhanced:
 
     def test_final_dataset_contains_only_finite_values(self):
         """Every model-facing numeric array must be finite."""
-        dataset = ForecastingDataset(
+        dataset = ContractForecastingDataset(
             sequences=make_sequence_array(),
             targets=make_target_values(),
             timestamps=np.arange(
@@ -1794,7 +2215,7 @@ class TestContractIntegrationEnhanced:
 
     def test_final_dataset_feature_order_matches_forecast_input(self):
         """Dataset metadata must be directly usable by the model input contract."""
-        dataset = ForecastingDataset(
+        dataset = ContractForecastingDataset(
             sequences=make_sequence_array(),
             targets=make_target_values(),
             timestamps=np.arange(

@@ -121,6 +121,7 @@ import numpy as np
 # =============================================================================
 
 from data.contracts import (
+    DEFAULT_FORECAST_CONTEXT_WINDOW,
     DEFAULT_FORECAST_HORIZON,
     DEFAULT_FORECAST_PRICE_COLUMN,
     DEFAULT_FORECAST_TARGET_NAME,
@@ -291,6 +292,7 @@ class ForecastingDataset:
     forecast_horizon: int
     target_name: str
     price_column: str = DEFAULT_FORECAST_PRICE_COLUMN
+    timestamp_windows: Optional[Tuple[Tuple[float, ...], ...]] = None
 
     def __post_init__(self) -> None:
         """Validate the complete aligned forecasting dataset."""
@@ -410,6 +412,13 @@ class ForecastingDataset:
             require_unique_timestamps=True,
         )
 
+        _validate_timestamp_windows(
+            timestamp_windows=self.timestamp_windows,
+            expected_samples=len(sequences),
+            context_window=self.context_window,
+            aligned_timestamps=timestamps,
+        )
+
     # -------------------------------------------------------------------------
     # Basic Dataset Properties
     # -------------------------------------------------------------------------
@@ -519,6 +528,32 @@ class ForecastingDataset:
         """
 
         return float(self.timestamps[-1])
+
+    def get_timestamp_window(
+        self,
+        index: int,
+    ) -> Tuple[float, ...]:
+        """Return the complete historical timestamp window for one sample."""
+
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError("index must be an integer.")
+
+        if index < 0 or index >= self.num_samples:
+            raise IndexError("ForecastingDataset index is out of range.")
+
+        if self.timestamp_windows is None:
+            raise ValueError(
+                "Complete timestamp windows are not stored in "
+                "ForecastingDataset."
+            )
+
+        return tuple(self.timestamp_windows[index])
+
+    @property
+    def has_timestamp_windows(self) -> bool:
+        """Return whether complete per-sample timestamp windows are stored."""
+
+        return self.timestamp_windows is not None
 
     # -------------------------------------------------------------------------
     # NVIDIA Contract Properties
@@ -723,12 +758,72 @@ class ForecastingDataset:
             forecast_horizon=self.forecast_horizon,
             target_name=self.target_name,
             price_column=self.price_column,
+            timestamp_windows=(
+                None
+                if self.timestamp_windows is None
+                else tuple(
+                    tuple(window)
+                    for window in self.timestamp_windows
+                )
+            ),
         )
 
 
 # =============================================================================
 # Validation Helpers
 # =============================================================================
+
+
+def _validate_timestamp_windows(
+    timestamp_windows: Optional[Tuple[Tuple[float, ...], ...]],
+    expected_samples: int,
+    context_window: int,
+    aligned_timestamps: np.ndarray,
+) -> None:
+    """Validate complete per-sample timestamp windows when supplied."""
+
+    if timestamp_windows is None:
+        return
+
+    if len(timestamp_windows) != expected_samples:
+        raise ValueError(
+            "timestamp_windows must contain exactly one window per sample."
+        )
+
+    for index, window in enumerate(timestamp_windows):
+        if len(window) != context_window:
+            raise ValueError(
+                f"Timestamp window {index} does not match context_window."
+            )
+
+        values = np.asarray(window, dtype=np.float64)
+
+        if values.ndim != 1:
+            raise ValueError(
+                f"Timestamp window {index} must be one-dimensional."
+            )
+
+        if not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"Timestamp window {index} must contain only finite values."
+            )
+
+        _validate_timestamp_order(
+            values,
+            require_chronological_order=True,
+            require_unique_timestamps=True,
+        )
+
+        if not np.isclose(
+            values[-1],
+            aligned_timestamps[index],
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"Timestamp window {index} must end at the aligned sample "
+                "timestamp."
+            )
 
 
 def _validate_positive_integer(
@@ -1190,6 +1285,7 @@ class ForecastingDatasetBuilder:
         aligned_sequences: List[np.ndarray] = []
         aligned_targets: List[float] = []
         aligned_timestamps: List[float] = []
+        aligned_timestamp_windows: List[Tuple[float, ...]] = []
 
         for index, timestamp in enumerate(
             sequence_end_timestamps
@@ -1222,6 +1318,13 @@ class ForecastingDatasetBuilder:
 
             aligned_timestamps.append(
                 timestamp_value
+            )
+
+            aligned_timestamp_windows.append(
+                tuple(
+                    float(value)
+                    for value in sequence_dataset.timestamps[index]
+                )
             )
 
         if not aligned_sequences:
@@ -1279,6 +1382,9 @@ class ForecastingDatasetBuilder:
             ),
             price_column=(
                 target_dataset.price_column
+            ),
+            timestamp_windows=tuple(
+                aligned_timestamp_windows
             ),
         )
 
@@ -1511,4 +1617,5 @@ __all__ = [
     "build_forecasting_dataset",
     "align_sequence_targets",
 ]
+
 

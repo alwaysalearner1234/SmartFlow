@@ -278,6 +278,52 @@ def _validate_feature_rows(
             )
 
 
+
+def _validate_timestamp_windows(
+    timestamp_windows: Sequence[Sequence[float]],
+    expected_samples: int,
+    context_window: int,
+    aligned_timestamps: Sequence[float],
+) -> Tuple[Tuple[float, ...], ...]:
+    """Validate and canonicalize complete per-sample timestamp windows."""
+
+    if timestamp_windows is None:
+        raise ValueError(
+            "timestamp_windows cannot be None when validation is requested."
+        )
+
+    if len(timestamp_windows) != expected_samples:
+        raise ValueError(
+            "timestamp_windows must contain exactly one window per sample."
+        )
+
+    canonical: List[Tuple[float, ...]] = []
+
+    for index, window in enumerate(timestamp_windows):
+        if len(window) != context_window:
+            raise ValueError(
+                f"timestamp_windows[{index}] must contain exactly "
+                f"{context_window} timestamps."
+            )
+
+        values = tuple(float(value) for value in window)
+        _validate_timestamp_sequence(
+            values,
+            f"timestamp_windows[{index}]",
+            require_unique=True,
+        )
+
+        aligned_timestamp = float(aligned_timestamps[index])
+        if values[-1] != aligned_timestamp:
+            raise ValueError(
+                f"timestamp_windows[{index}] must end at the aligned "
+                "sample timestamp."
+            )
+
+        canonical.append(values)
+
+    return tuple(canonical)
+
 # =============================================================================
 # Core Enumerations
 # =============================================================================
@@ -1356,10 +1402,15 @@ class ForecastingDataset:
     forecast_horizon: int
     target_name: str
     price_column: str = DEFAULT_FORECAST_PRICE_COLUMN
+    timestamp_windows: Optional[Tuple[Tuple[float, ...], ...]] = None
 
     def __post_init__(self) -> None:
         """
         Validate the aligned forecasting dataset.
+
+        ``timestamp_windows`` is optional for backward compatibility, but
+        when supplied it is the authoritative complete context-window
+        timestamp history required to construct a ``ForecastInput``.
         """
 
         _validate_positive_integer(
@@ -1552,6 +1603,18 @@ class ForecastingDataset:
             require_unique=True,
         )
 
+        if self.timestamp_windows is not None:
+            object.__setattr__(
+                self,
+                "timestamp_windows",
+                _validate_timestamp_windows(
+                    self.timestamp_windows,
+                    expected_samples=len(self.sequences),
+                    context_window=self.context_window,
+                    aligned_timestamps=timestamp_values,
+                ),
+            )
+
     @property
     def num_samples(self) -> int:
         """
@@ -1643,6 +1706,33 @@ class ForecastingDataset:
             self.num_features,
         )
 
+    @property
+    def has_timestamp_windows(self) -> bool:
+        """Return whether complete context-window timestamps are available."""
+
+        return self.timestamp_windows is not None
+
+    def get_timestamp_window(self, index: int) -> Tuple[float, ...]:
+        """Return the complete timestamp window for one sample."""
+
+        if not isinstance(index, int):
+            raise TypeError(
+                "index must be an integer."
+            )
+
+        if index < 0 or index >= self.num_samples:
+            raise IndexError(
+                "ForecastingDataset index is out of range."
+            )
+
+        if self.timestamp_windows is None:
+            raise ValueError(
+                "Complete timestamp windows are not stored in "
+                "ForecastingDataset."
+            )
+
+        return tuple(self.timestamp_windows[index])
+
     def to_forecast_input(
         self,
         index: int,
@@ -1705,27 +1795,31 @@ class ForecastingDataset:
         upstream integrations that retain those windows.
         """
 
-        timestamp_windows = getattr(
-            self,
-            "timestamp_windows",
-            None,
+        return self.get_timestamp_window(index)
+
+    def copy(self) -> "ForecastingDataset":
+        """Return an independent copy of the forecasting dataset."""
+
+        import copy as _copy
+
+        return ForecastingDataset(
+            sequences=self.sequences.copy(),
+            targets=self.targets.copy(),
+            timestamps=self.timestamps.copy(),
+            feature_names=tuple(self.feature_names),
+            context_window=self.context_window,
+            forecast_horizon=self.forecast_horizon,
+            target_name=self.target_name,
+            price_column=self.price_column,
+            timestamp_windows=(
+                None
+                if self.timestamp_windows is None
+                else tuple(
+                    tuple(window)
+                    for window in _copy.deepcopy(self.timestamp_windows)
+                )
+            ),
         )
-
-        if timestamp_windows is None:
-            raise ValueError(
-                "Complete timestamp windows are not stored in "
-                "ForecastingDataset. A ForecastInput requires the "
-                "original context-window timestamps."
-            )
-
-        window = timestamp_windows[index]
-
-        if len(window) != self.context_window:
-            raise ValueError(
-                "Stored timestamp window does not match context_window."
-            )
-
-        return window
 
 
 # =============================================================================

@@ -1792,3 +1792,499 @@ class TestConvenienceAPIs:
             second.timestamps,
         )
 
+
+# =============================================================================
+# Phase 10 — Final Forecasting Pipeline / NVIDIA I/O Contract
+# =============================================================================
+
+
+class TestTimestampWindowIntegration:
+    """Validate preservation of the complete context timestamp windows."""
+
+    def test_timestamp_windows_are_present_on_built_dataset(self):
+        """The builder must preserve one complete timestamp window per sample."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.has_timestamp_windows is True
+        assert dataset.timestamp_windows is not None
+        assert len(dataset.timestamp_windows) == dataset.num_samples
+
+    def test_timestamp_window_has_context_length(self):
+        """Every stored timestamp window must match context_window."""
+
+        dataset = make_forecasting_dataset()
+
+        assert all(
+            len(window) == dataset.context_window
+            for window in dataset.timestamp_windows
+        )
+
+    def test_first_timestamp_window_is_exact(self):
+        """The first stored window must be the original sequence window."""
+
+        dataset = make_forecasting_dataset()
+
+        expected = tuple(
+            float(value)
+            for value in range(1000, 1020)
+        )
+
+        assert dataset.timestamp_windows[0] == expected
+        assert dataset.get_timestamp_window(0) == expected
+
+    def test_last_timestamp_of_each_window_matches_aligned_timestamp(self):
+        """Window endpoints must equal the aligned sample timestamps."""
+
+        dataset = make_forecasting_dataset()
+
+        for index, window in enumerate(dataset.timestamp_windows):
+            assert window[-1] == pytest.approx(
+                dataset.timestamps[index]
+            )
+
+    def test_timestamp_windows_are_strictly_chronological(self):
+        """Every context timestamp window must be strictly increasing."""
+
+        dataset = make_forecasting_dataset()
+
+        for window in dataset.timestamp_windows:
+            assert np.all(np.diff(window) > 0)
+
+    def test_timestamp_windows_are_unique_within_each_sample(self):
+        """A context window cannot contain duplicate timestamps."""
+
+        dataset = make_forecasting_dataset()
+
+        for window in dataset.timestamp_windows:
+            assert len(set(window)) == len(window)
+
+    def test_timestamp_windows_shift_one_step_between_adjacent_samples(self):
+        """Rolling windows must advance by exactly one timestamp."""
+
+        dataset = make_forecasting_dataset()
+
+        first = np.asarray(dataset.timestamp_windows[0])
+        second = np.asarray(dataset.timestamp_windows[1])
+
+        np.testing.assert_array_equal(
+            second[:-1],
+            first[1:],
+        )
+
+        assert second[-1] == pytest.approx(first[-1] + 1.0)
+
+    def test_non_unit_spacing_is_preserved_in_timestamp_windows(self):
+        """The original timestamp spacing must survive alignment."""
+
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(
+                num_rows=30,
+                context_window=10,
+                timestamp_step=0.5,
+            ),
+            make_target_dataset(
+                num_rows=30,
+                timestamp_step=0.5,
+            ),
+        )
+
+        window = np.asarray(dataset.timestamp_windows[0])
+
+        np.testing.assert_allclose(
+            np.diff(window),
+            0.5,
+        )
+
+        assert window[0] == pytest.approx(1000.0)
+        assert window[-1] == pytest.approx(1004.5)
+
+    def test_timestamp_window_count_matches_sequence_count_after_alignment(self):
+        """Dropped unmatched sequences must also be removed from timestamp windows."""
+
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            make_target_dataset(num_rows=25),
+        )
+
+        assert len(dataset.timestamp_windows) == dataset.num_samples
+        assert dataset.num_samples < 21
+
+        for index, window in enumerate(dataset.timestamp_windows):
+            assert window[-1] == pytest.approx(dataset.timestamps[index])
+
+    def test_timestamp_windows_are_immutable_tuples(self):
+        """Stored timestamp windows use tuple-based immutable containers."""
+
+        dataset = make_forecasting_dataset()
+
+        assert isinstance(dataset.timestamp_windows, tuple)
+        assert all(
+            isinstance(window, tuple)
+            for window in dataset.timestamp_windows
+        )
+
+    def test_get_timestamp_window_returns_tuple(self):
+        """The public timestamp-window accessor returns an immutable tuple."""
+
+        dataset = make_forecasting_dataset()
+
+        result = dataset.get_timestamp_window(0)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 20
+
+    def test_get_timestamp_window_rejects_negative_index(self):
+        """Negative timestamp-window indices are rejected."""
+
+        dataset = make_forecasting_dataset()
+
+        with pytest.raises(IndexError):
+            dataset.get_timestamp_window(-1)
+
+    def test_get_timestamp_window_rejects_upper_bound(self):
+        """The upper sample boundary is rejected."""
+
+        dataset = make_forecasting_dataset()
+
+        with pytest.raises(IndexError):
+            dataset.get_timestamp_window(dataset.num_samples)
+
+    @pytest.mark.parametrize(
+        "index",
+        [0.0, "0", True, None],
+    )
+    def test_get_timestamp_window_rejects_non_integer_index(self, index):
+        """The accessor requires a real integer index."""
+
+        dataset = make_forecasting_dataset()
+
+        with pytest.raises(TypeError):
+            dataset.get_timestamp_window(index)
+
+
+class TestTimestampWindowValidation:
+    """Validate constructor-level timestamp-window integrity checks."""
+
+    def _valid_dataset_kwargs(self):
+        """Return valid constructor arguments for targeted validation tests."""
+
+        dataset = make_forecasting_dataset()
+
+        return {
+            "sequences": dataset.sequences.copy(),
+            "targets": dataset.targets.copy(),
+            "timestamps": dataset.timestamps.copy(),
+            "feature_names": tuple(dataset.feature_names),
+            "context_window": dataset.context_window,
+            "forecast_horizon": dataset.forecast_horizon,
+            "target_name": dataset.target_name,
+            "price_column": dataset.price_column,
+            "timestamp_windows": tuple(
+                tuple(window)
+                for window in dataset.timestamp_windows
+            ),
+        }
+
+    def test_wrong_number_of_timestamp_windows_is_rejected(self):
+        """There must be exactly one timestamp window per sample."""
+
+        kwargs = self._valid_dataset_kwargs()
+        kwargs["timestamp_windows"] = kwargs["timestamp_windows"][:-1]
+
+        with pytest.raises(ValueError, match="timestamp_windows"):
+            ForecastingDataset(**kwargs)
+
+    def test_wrong_window_length_is_rejected(self):
+        """Each timestamp window must contain exactly context_window values."""
+
+        kwargs = self._valid_dataset_kwargs()
+        windows = list(kwargs["timestamp_windows"])
+        windows[0] = windows[0][1:]
+        kwargs["timestamp_windows"] = tuple(windows)
+
+        with pytest.raises(ValueError, match="context_window"):
+            ForecastingDataset(**kwargs)
+
+    def test_nan_timestamp_window_value_is_rejected(self):
+        """Timestamp windows cannot contain NaN values."""
+
+        kwargs = self._valid_dataset_kwargs()
+        windows = [list(window) for window in kwargs["timestamp_windows"]]
+        windows[0][5] = np.nan
+        kwargs["timestamp_windows"] = tuple(tuple(window) for window in windows)
+
+        with pytest.raises(ValueError, match="finite"):
+            ForecastingDataset(**kwargs)
+
+    def test_infinite_timestamp_window_value_is_rejected(self):
+        """Timestamp windows cannot contain infinite values."""
+
+        kwargs = self._valid_dataset_kwargs()
+        windows = [list(window) for window in kwargs["timestamp_windows"]]
+        windows[0][5] = np.inf
+        kwargs["timestamp_windows"] = tuple(tuple(window) for window in windows)
+
+        with pytest.raises(ValueError, match="finite"):
+            ForecastingDataset(**kwargs)
+
+    def test_duplicate_timestamp_inside_window_is_rejected(self):
+        """Timestamp windows must have unique timestamps."""
+
+        kwargs = self._valid_dataset_kwargs()
+        windows = [list(window) for window in kwargs["timestamp_windows"]]
+        windows[0][5] = windows[0][4]
+        kwargs["timestamp_windows"] = tuple(tuple(window) for window in windows)
+
+        with pytest.raises(ValueError):
+            ForecastingDataset(**kwargs)
+
+    def test_non_chronological_timestamp_window_is_rejected(self):
+        """Timestamp windows must be strictly chronological."""
+
+        kwargs = self._valid_dataset_kwargs()
+        windows = [list(window) for window in kwargs["timestamp_windows"]]
+        windows[0][5], windows[0][6] = windows[0][6], windows[0][5]
+        kwargs["timestamp_windows"] = tuple(tuple(window) for window in windows)
+
+        with pytest.raises(ValueError):
+            ForecastingDataset(**kwargs)
+
+    def test_window_endpoint_must_match_aligned_timestamp(self):
+        """The final timestamp in each window must equal sample timestamp."""
+
+        kwargs = self._valid_dataset_kwargs()
+        windows = [list(window) for window in kwargs["timestamp_windows"]]
+        windows[0][-1] += 0.25
+        kwargs["timestamp_windows"] = tuple(tuple(window) for window in windows)
+
+        with pytest.raises(ValueError, match="aligned sample timestamp"):
+            ForecastingDataset(**kwargs)
+
+    def test_timestamp_windows_are_optional_for_backward_compatibility(self):
+        """Manually constructed legacy datasets may omit timestamp windows."""
+
+        kwargs = self._valid_dataset_kwargs()
+        kwargs["timestamp_windows"] = None
+
+        dataset = ForecastingDataset(**kwargs)
+
+        assert dataset.has_timestamp_windows is False
+
+        with pytest.raises(ValueError, match="Complete timestamp windows"):
+            dataset.get_timestamp_window(0)
+
+
+class TestNvidiaIntegrationContract:
+    """Validate the completed dataset against the canonical NVIDIA contract."""
+
+    def test_built_nvidia_dataset_reports_compatible(self):
+        """The canonical generated dataset satisfies the NVIDIA contract."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.is_nvidia_compatible is True
+        dataset.validate_nvidia_compatibility()
+        ForecastingDatasetBuilder().validate_nvidia_contract(dataset)
+
+    def test_nvidia_contract_does_not_modify_dataset(self):
+        """Compatibility validation must be observational only."""
+
+        dataset = make_forecasting_dataset()
+        before_sequences = dataset.sequences.copy()
+        before_targets = dataset.targets.copy()
+        before_timestamps = dataset.timestamps.copy()
+        before_windows = dataset.timestamp_windows
+
+        dataset.validate_nvidia_compatibility()
+
+        np.testing.assert_array_equal(dataset.sequences, before_sequences)
+        np.testing.assert_array_equal(dataset.targets, before_targets)
+        np.testing.assert_array_equal(dataset.timestamps, before_timestamps)
+        assert dataset.timestamp_windows == before_windows
+
+    def test_wrong_feature_order_is_not_nvidia_compatible(self):
+        """Changing feature order must invalidate the NVIDIA contract."""
+
+        dataset = make_forecasting_dataset()
+        kwargs = {
+            "sequences": dataset.sequences.copy(),
+            "targets": dataset.targets.copy(),
+            "timestamps": dataset.timestamps.copy(),
+            "feature_names": tuple(reversed(dataset.feature_names)),
+            "context_window": dataset.context_window,
+            "forecast_horizon": dataset.forecast_horizon,
+            "target_name": dataset.target_name,
+            "price_column": dataset.price_column,
+            "timestamp_windows": dataset.timestamp_windows,
+        }
+
+        modified = ForecastingDataset(**kwargs)
+
+        assert modified.is_nvidia_compatible is False
+
+        with pytest.raises(ValueError, match="feature order"):
+            modified.validate_nvidia_compatibility()
+
+    def test_wrong_horizon_is_not_nvidia_compatible(self):
+        """Changing the forecast horizon must invalidate the NVIDIA contract."""
+
+        dataset = make_forecasting_dataset(forecast_horizon=4)
+
+        assert dataset.is_nvidia_compatible is False
+
+        with pytest.raises(ValueError, match="forecast horizon"):
+            dataset.validate_nvidia_compatibility()
+
+    def test_wrong_target_name_is_not_nvidia_compatible(self):
+        """Changing the target name must invalidate the NVIDIA contract."""
+
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            make_target_dataset(target_name="wrong_target"),
+        )
+
+        assert dataset.is_nvidia_compatible is False
+
+        with pytest.raises(ValueError, match="target"):
+            dataset.validate_nvidia_compatibility()
+
+    def test_wrong_context_window_is_not_nvidia_compatible(self):
+        """A noncanonical context window must not pass NVIDIA validation."""
+
+        dataset = make_forecasting_dataset(
+            num_rows=25,
+            context_window=5,
+        )
+
+        assert dataset.is_nvidia_compatible is False
+
+        with pytest.raises(ValueError, match="context_window"):
+            dataset.validate_nvidia_compatibility()
+
+    def test_wrong_price_column_is_not_nvidia_compatible(self):
+        """Changing the source price-column metadata invalidates the contract."""
+
+        dataset = build_forecasting_dataset(
+            make_sequence_dataset(),
+            make_target_dataset(price_column="other_price"),
+        )
+
+        assert dataset.is_nvidia_compatible is False
+
+        with pytest.raises(ValueError, match="price column"):
+            dataset.validate_nvidia_compatibility()
+
+
+class TestTimestampWindowCopyAndDeterminism:
+    """Validate timestamp-window preservation under copying and repeated builds."""
+
+    def test_copy_preserves_timestamp_windows(self):
+        """copy() preserves the complete timestamp-window contract."""
+
+        dataset = make_forecasting_dataset()
+        copied = dataset.copy()
+
+        assert copied.timestamp_windows == dataset.timestamp_windows
+        assert copied.has_timestamp_windows is True
+
+    def test_copy_creates_independent_timestamp_window_container(self):
+        """The copied timestamp-window container is independently allocated."""
+
+        dataset = make_forecasting_dataset()
+        copied = dataset.copy()
+
+        assert copied.timestamp_windows is not dataset.timestamp_windows
+        assert copied.timestamp_windows == dataset.timestamp_windows
+
+    def test_repeated_builds_preserve_identical_timestamp_windows(self):
+        """Repeated builds must produce identical timestamp-window metadata."""
+
+        sequences = make_sequence_dataset()
+        targets = make_target_dataset()
+
+        first = build_forecasting_dataset(sequences, targets)
+        second = build_forecasting_dataset(sequences, targets)
+
+        assert first.timestamp_windows == second.timestamp_windows
+
+    def test_source_sequence_timestamp_windows_are_not_modified(self):
+        """Building a dataset must not modify source sequence timestamps."""
+
+        sequences = make_sequence_dataset()
+        before = tuple(tuple(window) for window in sequences.timestamps)
+
+        build_forecasting_dataset(sequences, make_target_dataset())
+
+        after = tuple(tuple(window) for window in sequences.timestamps)
+        assert after == before
+
+    def test_timestamp_windows_preserve_source_values_exactly(self):
+        """Aligned windows must match the source SequenceDataset windows exactly."""
+
+        sequences = make_sequence_dataset()
+        dataset = build_forecasting_dataset(
+            sequences,
+            make_target_dataset(),
+        )
+
+        expected = tuple(
+            tuple(window)
+            for window in sequences.timestamps
+        )
+
+        assert dataset.timestamp_windows == expected
+
+
+class TestFinalPhaseTenPipelineContract:
+    """Lock the complete Person 1 Phase 10 data-side contract."""
+
+    def test_final_nvidia_ready_dataset_contract(self):
+        """The final dataset exposes every required NVIDIA-facing invariant."""
+
+        dataset = make_forecasting_dataset(num_rows=100)
+
+        assert dataset.is_nvidia_compatible is True
+        assert dataset.has_timestamp_windows is True
+        assert dataset.shape == (81, 20, 14)
+        assert dataset.input_shape == (20, 14)
+        assert dataset.targets.shape == (81,)
+        assert dataset.timestamps.shape == (81,)
+        assert len(dataset.timestamp_windows) == 81
+        assert all(len(window) == 20 for window in dataset.timestamp_windows)
+        assert dataset.feature_names == FEATURE_NAMES
+        assert dataset.context_window == 20
+        assert dataset.forecast_horizon == 5
+        assert dataset.target_name == TARGET_NAME
+        assert dataset.price_column == PRICE_COLUMN
+
+    def test_target_is_not_embedded_in_feature_tensor(self):
+        """The future target remains separate from model feature inputs."""
+
+        dataset = make_forecasting_dataset()
+
+        assert dataset.sequences.shape[-1] == len(FEATURE_NAMES)
+        assert TARGET_NAME not in dataset.feature_names
+
+    def test_aligned_timestamp_is_window_endpoint_for_every_sample(self):
+        """Every model sample's timestamp corresponds to its context endpoint."""
+
+        dataset = make_forecasting_dataset(num_rows=100)
+
+        for index in range(dataset.num_samples):
+            assert dataset.get_timestamp_window(index)[-1] == pytest.approx(
+                dataset.timestamps[index]
+            )
+
+    def test_final_pipeline_is_deterministic(self):
+        """The same inputs must produce the same final NVIDIA-ready dataset."""
+
+        first = make_forecasting_dataset(num_rows=100)
+        second = make_forecasting_dataset(num_rows=100)
+
+        np.testing.assert_array_equal(first.sequences, second.sequences)
+        np.testing.assert_array_equal(first.targets, second.targets)
+        np.testing.assert_array_equal(first.timestamps, second.timestamps)
+        assert first.timestamp_windows == second.timestamp_windows
+        assert first.feature_names == second.feature_names
+
