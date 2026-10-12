@@ -40,6 +40,9 @@ from data.contracts import (
     SequenceDataset,
     TargetDataset,
     validate_forecasting_dataset_contract,
+    validate_nvidia_feature_contract,
+    validate_nvidia_forecast_input_contract,
+    validate_nvidia_forecast_result_contract,
 )
 
 from data.forecasting_dataset import ForecastingDataset
@@ -2254,4 +2257,108 @@ class TestContractIntegrationEnhanced:
 
         assert result.expected_move_bps == pytest.approx(10.0)
 
+# ---------------------------------------------------------------------------
+# Phase 11: explicit NVIDIA model-boundary contract validators
+# ---------------------------------------------------------------------------
+
+
+class TestNvidiaModelBoundaryValidators:
+    """Regression tests for the strict NVIDIA input/output boundary validators."""
+
+    def make_input(self, **overrides):
+        values = {
+            "feature_sequence": make_feature_sequence(),
+            "feature_names": FEATURE_NAMES.copy(),
+            "timestamps": make_timestamps(),
+            "context_window": CONTEXT_WINDOW,
+            "forecast_horizon": FORECAST_HORIZON,
+        }
+        values.update(overrides)
+        return ForecastInput(**values)
+
+    def make_result(self, **overrides):
+        values = {
+            "timestamp": 2_000.0,
+            "forecast_horizon": FORECAST_HORIZON,
+            "predicted_return": 0.001,
+            "model_name": "nvidia-forecaster",
+            "model_version": "test-1",
+            "model_status": ModelStatus.SUCCESS,
+            "feature_names": FEATURE_NAMES.copy(),
+        }
+        values.update(overrides)
+        return ForecastResult(**values)
+
+    def test_canonical_feature_validator_accepts_exact_order(self):
+        """The canonical ordered feature vector passes validation."""
+        validate_nvidia_feature_contract(FEATURE_NAMES)
+
+    def test_canonical_feature_validator_rejects_reordered_features(self):
+        """Feature order is significant at the NVIDIA model boundary."""
+        reordered = FEATURE_NAMES.copy()
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+
+        with pytest.raises(ValueError, match="feature contract mismatch"):
+            validate_nvidia_feature_contract(reordered)
+
+    def test_input_validator_accepts_canonical_20_by_14_input(self):
+        """A correctly shaped 20 x 14 input with horizon five is accepted."""
+        validate_nvidia_forecast_input_contract(self.make_input())
+
+    def test_input_validator_rejects_non_forecast_input_object(self):
+        """The validator requires the documented ForecastInput type."""
+        with pytest.raises(TypeError, match="ForecastInput"):
+            validate_nvidia_forecast_input_contract(object())
+
+    def test_input_validator_rejects_wrong_context_window(self):
+        """Generic inputs may be valid structurally but not for NVIDIA."""
+        with pytest.raises(ValueError, match="context window must be 20"):
+            validate_nvidia_forecast_input_contract(
+                self.make_input(
+                    feature_sequence=make_feature_sequence(context_window=19),
+                    timestamps=make_timestamps(count=19),
+                    context_window=19,
+                )
+            )
+
+    def test_input_validator_rejects_wrong_forecast_horizon(self):
+        """The NVIDIA model contract requires a five-step forecast horizon."""
+        with pytest.raises(ValueError, match="horizon must be 5"):
+            validate_nvidia_forecast_input_contract(
+                self.make_input(forecast_horizon=4)
+            )
+
+    def test_input_validator_rejects_noncanonical_feature_order(self):
+        """Inputs with the right shape but wrong feature order are rejected."""
+        reordered = FEATURE_NAMES.copy()
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        with pytest.raises(ValueError, match="feature contract mismatch"):
+            validate_nvidia_forecast_input_contract(
+                self.make_input(feature_names=reordered)
+            )
+
+    def test_result_validator_accepts_canonical_result(self):
+        """A five-step result with canonical feature metadata is accepted."""
+        validate_nvidia_forecast_result_contract(self.make_result())
+
+    def test_result_validator_rejects_non_forecast_result_object(self):
+        """The result validator requires the documented ForecastResult type."""
+        with pytest.raises(TypeError, match="ForecastResult"):
+            validate_nvidia_forecast_result_contract(object())
+
+    def test_result_validator_rejects_wrong_horizon(self):
+        """Result horizons that disagree with the NVIDIA contract are rejected."""
+        with pytest.raises(ValueError, match="horizon must be 5"):
+            validate_nvidia_forecast_result_contract(
+                self.make_result(forecast_horizon=4)
+            )
+
+    def test_result_validator_rejects_noncanonical_feature_order(self):
+        """Output metadata must preserve the same canonical feature order."""
+        reordered = FEATURE_NAMES.copy()
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        with pytest.raises(ValueError, match="feature contract mismatch"):
+            validate_nvidia_forecast_result_contract(
+                self.make_result(feature_names=reordered)
+            )
 

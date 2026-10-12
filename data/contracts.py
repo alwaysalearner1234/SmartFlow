@@ -81,7 +81,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-
 # =============================================================================
 # Shared Validation Helpers
 # =============================================================================
@@ -297,21 +296,31 @@ def _validate_timestamp_windows(
             "timestamp_windows must contain exactly one window per sample."
         )
 
+    if isinstance(timestamp_windows, (str, bytes)):
+        raise TypeError("timestamp_windows must be a sequence of timestamp windows.")
+
     canonical: List[Tuple[float, ...]] = []
 
     for index, window in enumerate(timestamp_windows):
+        if isinstance(window, (str, bytes)) or not isinstance(window, Sequence):
+            raise TypeError(
+                f"timestamp_windows[{index}] must be a sequence of timestamps."
+            )
+
         if len(window) != context_window:
             raise ValueError(
                 f"timestamp_windows[{index}] must contain exactly "
                 f"{context_window} timestamps."
             )
 
-        values = tuple(float(value) for value in window)
+        # Validate original values before converting them. Converting first
+        # would accidentally accept booleans and numeric strings as timestamps.
         _validate_timestamp_sequence(
-            values,
+            window,
             f"timestamp_windows[{index}]",
             require_unique=True,
         )
+        values = tuple(float(value) for value in window)
 
         aligned_timestamp = float(aligned_timestamps[index])
         if values[-1] != aligned_timestamp:
@@ -556,6 +565,65 @@ def validate_nvidia_feature_contract(
         )
 
 
+def validate_nvidia_forecast_input_contract(
+    forecast_input: "ForecastInput",
+) -> None:
+    """Validate one input against the complete NVIDIA model I/O contract.
+
+    ``ForecastInput`` remains usable as a generic chronological input for
+    backward compatibility. Call this stricter validator at the NVIDIA model
+    boundary to enforce the agreed 20 x 14 input and five-step horizon.
+    """
+
+    if not isinstance(forecast_input, ForecastInput):
+        raise TypeError("forecast_input must be a ForecastInput instance.")
+
+    if forecast_input.context_window != DEFAULT_FORECAST_CONTEXT_WINDOW:
+        raise ValueError(
+            "NVIDIA forecasting context window must be "
+            f"{DEFAULT_FORECAST_CONTEXT_WINDOW}; received "
+            f"{forecast_input.context_window}."
+        )
+
+    if forecast_input.forecast_horizon != DEFAULT_FORECAST_HORIZON:
+        raise ValueError(
+            "NVIDIA forecasting horizon must be "
+            f"{DEFAULT_FORECAST_HORIZON}; received "
+            f"{forecast_input.forecast_horizon}."
+        )
+
+    validate_nvidia_feature_contract(forecast_input.feature_names)
+
+    if forecast_input.shape != (
+        DEFAULT_FORECAST_CONTEXT_WINDOW,
+        len(NVIDIA_FORECAST_FEATURES),
+    ):
+        raise ValueError(
+            "NVIDIA forecasting input shape must be "
+            f"({DEFAULT_FORECAST_CONTEXT_WINDOW}, "
+            f"{len(NVIDIA_FORECAST_FEATURES)}); received "
+            f"{forecast_input.shape}."
+        )
+
+
+def validate_nvidia_forecast_result_contract(
+    forecast_result: "ForecastResult",
+) -> None:
+    """Validate a forecast result against the agreed NVIDIA output contract."""
+
+    if not isinstance(forecast_result, ForecastResult):
+        raise TypeError("forecast_result must be a ForecastResult instance.")
+
+    if forecast_result.forecast_horizon != DEFAULT_FORECAST_HORIZON:
+        raise ValueError(
+            "NVIDIA forecast result horizon must be "
+            f"{DEFAULT_FORECAST_HORIZON}; received "
+            f"{forecast_result.forecast_horizon}."
+        )
+
+    validate_nvidia_feature_contract(forecast_result.feature_names)
+
+
 # =============================================================================
 # Forecast Input Contract
 # =============================================================================
@@ -598,6 +666,16 @@ class ForecastInput:
             self.forecast_horizon,
             "forecast_horizon",
         )
+
+        if isinstance(self.feature_sequence, (str, bytes)) or not isinstance(
+            self.feature_sequence, Sequence
+        ):
+            raise TypeError("feature_sequence must be a sequence of feature rows.")
+
+        if isinstance(self.timestamps, (str, bytes)) or not isinstance(
+            self.timestamps, Sequence
+        ):
+            raise TypeError("timestamps must be a sequence of numeric timestamps.")
 
         if len(self.feature_sequence) != self.context_window:
             raise ValueError(
@@ -2030,6 +2108,8 @@ __all__ = [
 
     # NVIDIA forecasting validation
     "validate_nvidia_feature_contract",
+    "validate_nvidia_forecast_input_contract",
+    "validate_nvidia_forecast_result_contract",
     "validate_forecasting_dataset_contract",
 
     # Forecasting model contracts

@@ -19,7 +19,7 @@ from strategies.twap import TWAPStrategy
 from strategies.vwap import VWAPStrategy
 from strategies.proposed import ProposedStrategy
 from execution.strategy_engine import DynamicStrategyEngine
-
+from models.predictor import PredictionResult, ModelStatus 
 
 @pytest.fixture
 def mock_snapshot():
@@ -116,10 +116,27 @@ def test_passive_strategy_adverse_backoff(mock_snapshot):
     assert dec_high.quantity == 0.0
     assert "adverse risk" in dec_high.reason.lower()
 
-
 def test_dynamic_strategy_engine_decisions(mock_snapshot):
     engine = DynamicStrategyEngine()
-    features = {"depth_imbalance_l1": 0.5, "spread_expansion_ratio": 1.0, "volatility_std_10": 0.15}
+
+    # Keep this test deterministic: exercise the decision engine with
+    # a known low passive-exposure risk instead of relying on a local model.
+    def low_risk_prediction(features, side=OrderSide.BUY, timestamp=0.0):
+        return PredictionResult(
+            probability=0.20,
+            timestamp=timestamp,
+            prediction_horizon=10,
+            model_name="Deterministic Test Predictor",
+            model_status=ModelStatus.FALLBACK_HEURISTIC,
+        )
+
+    engine.predictor.predict = low_risk_prediction
+
+    features = {
+        "depth_imbalance_l1": 0.5,
+        "spread_expansion_ratio": 1.0,
+        "volatility_std_10": 0.15,
+    }
 
     decision = engine.evaluate_and_decide(
         strategy_name="Proposed (ML + AC)",
@@ -131,6 +148,8 @@ def test_dynamic_strategy_engine_decisions(mock_snapshot):
         total_horizon=60.0,
         side=OrderSide.BUY,
     )
+
     assert isinstance(decision, ExecutionDecision)
     assert decision.quantity > 0
     assert len(decision.reason) > 10
+
