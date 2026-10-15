@@ -2079,6 +2079,123 @@ class ExecutionContext:
 
 
 # =============================================================================
+
+# =============================================================================
+# Phase 12: Data-quality reporting contracts
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DataQualityIssue:
+    """One normalized data-quality finding.
+
+    ``row_index`` and ``field`` are optional because some checks apply to an
+    entire dataset rather than a particular cell.
+    """
+
+    code: str
+    message: str
+    severity: str = "error"
+    row_index: Optional[int] = None
+    field: Optional[str] = None
+    value: Any = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, str) or not self.code.strip():
+            raise ValueError("code must be a non-empty string")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("message must be a non-empty string")
+        if self.severity not in {"info", "warning", "error", "critical"}:
+            raise ValueError(
+                "severity must be one of: info, warning, error, critical"
+            )
+        if self.row_index is not None:
+            if isinstance(self.row_index, bool) or not isinstance(self.row_index, int):
+                raise TypeError("row_index must be an integer or None")
+            if self.row_index < 0:
+                raise ValueError("row_index must be non-negative")
+        if self.field is not None and not isinstance(self.field, str):
+            raise TypeError("field must be a string or None")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-friendly representation of the issue."""
+        return {
+            "code": self.code,
+            "message": self.message,
+            "severity": self.severity,
+            "row_index": self.row_index,
+            "field": self.field,
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True)
+class DataQualityReport:
+    """Immutable summary of a validation run.
+
+    ``total_records`` counts records examined; ``valid_records`` counts records
+    that passed the applicable checks. Issues remain explicit and structured
+    so callers can aggregate them without parsing human-readable messages.
+    """
+
+    total_records: int
+    valid_records: int
+    issues: Tuple[DataQualityIssue, ...] = field(default_factory=tuple)
+    dataset_name: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("total_records", self.total_records),
+            ("valid_records", self.valid_records),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.valid_records > self.total_records:
+            raise ValueError("valid_records cannot exceed total_records")
+        if not isinstance(self.issues, tuple):
+            object.__setattr__(self, "issues", tuple(self.issues))
+        if any(not isinstance(issue, DataQualityIssue) for issue in self.issues):
+            raise TypeError("issues must contain only DataQualityIssue objects")
+        if self.dataset_name is not None and not isinstance(self.dataset_name, str):
+            raise TypeError("dataset_name must be a string or None")
+
+    @property
+    def invalid_records(self) -> int:
+        """Number of records not counted as valid."""
+        return self.total_records - self.valid_records
+
+    @property
+    def is_valid(self) -> bool:
+        """Whether the report contains no warning-or-higher findings."""
+        return not any(
+            issue.severity in {"warning", "error", "critical"}
+            for issue in self.issues
+        ) and self.invalid_records == 0
+
+    @property
+    def error_count(self) -> int:
+        return sum(issue.severity in {"error", "critical"} for issue in self.issues)
+
+    @property
+    def warning_count(self) -> int:
+        return sum(issue.severity == "warning" for issue in self.issues)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a stable summary suitable for logging or JSON serialization."""
+        return {
+            "dataset_name": self.dataset_name,
+            "total_records": self.total_records,
+            "valid_records": self.valid_records,
+            "invalid_records": self.invalid_records,
+            "is_valid": self.is_valid,
+            "error_count": self.error_count,
+            "warning_count": self.warning_count,
+            "issues": [issue.to_dict() for issue in self.issues],
+        }
+
+
 # Public Module API
 # =============================================================================
 
@@ -2132,6 +2249,10 @@ __all__ = [
 
     # Backtesting contracts
     "BacktestResult",
+
+    # Phase 12 data-quality reporting contracts
+    "DataQualityIssue",
+    "DataQualityReport",
 
     # Forecasting dataset contracts
     "SequenceDataset",

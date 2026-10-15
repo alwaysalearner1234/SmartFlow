@@ -57,6 +57,7 @@ routing, portfolio management, or real-world order execution.
 # ---------------------------------------------------------------------------
 
 import math
+import numbers
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -127,17 +128,54 @@ class MarketDataGenerator:
 
         self.config = config or MarketConfig()
 
-        self.seed = (
-            seed
-            if seed is not None
-            else self.config.random_seed
-        )
+        self._validate_market_config(self.config)
+
+        self.seed = seed if seed is not None else self.config.random_seed
+        if self.seed is not None and (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, numbers.Integral)
+        ):
+            raise ValueError("seed must be an integer or None.")
 
         self.rng = np.random.default_rng(self.seed)
+        self.validator = MarketDataValidator(tick_size=self.config.tick_size)
 
-        self.validator = MarketDataValidator(
-            tick_size=self.config.tick_size
+    @staticmethod
+    def _validate_market_config(config: MarketConfig) -> None:
+        """Reject invalid configuration before it can contaminate a stream."""
+        positive_finite = (
+            "tick_size", "lot_size", "initial_price", "base_spread",
+            "base_volatility", "base_depth_per_level",
         )
+        for name in positive_finite:
+            value = getattr(config, name, None)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"config.{name} must be a finite number greater than zero.")
+
+        levels = config.num_levels
+        if isinstance(levels, bool) or not isinstance(levels, numbers.Integral) or levels < 1:
+            raise ValueError("config.num_levels must be a positive integer.")
+
+    @staticmethod
+    def _validate_stream_parameters(
+        num_ticks: int, dt: float, start_time: float
+    ) -> None:
+        """Validate stream parameters and reject NaN/inf values explicitly."""
+        if isinstance(num_ticks, bool) or not isinstance(num_ticks, numbers.Integral) or num_ticks <= 0:
+            raise ValueError("num_ticks must be a positive integer.")
+        for name, value in (("dt", dt), ("start_time", start_time)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"{name} must be a finite number greater than zero.")
 
     # -----------------------------------------------------------------------
     # Scenario Stream Generation
@@ -195,34 +233,30 @@ class MarketDataGenerator:
         # Validate generation parameters
         # -------------------------------------------------------------------
 
-        if num_ticks <= 0:
-            raise ValueError(
-                "num_ticks must be greater than zero."
-            )
-
-        if dt <= 0:
-            raise ValueError(
-                "dt must be greater than zero."
-            )
-
-        if start_time <= 0:
-            raise ValueError(
-                "start_time must be greater than zero."
-            )
+        self._validate_stream_parameters(num_ticks, dt, start_time)
 
         # -------------------------------------------------------------------
         # Load scenario configuration
         # -------------------------------------------------------------------
 
-        scenario = SCENARIOS.get(
-            scenario_key,
-            SCENARIOS["normal_market"],
-        )
+        if not isinstance(scenario_key, str) or not scenario_key.strip():
+            raise ValueError("scenario_key must be a non-empty string.")
+        if scenario_key not in SCENARIOS:
+            available = ", ".join(sorted(SCENARIOS))
+            raise ValueError(
+                f"Unknown scenario_key {scenario_key!r}. Available scenarios: {available}"
+            )
+        scenario = SCENARIOS[scenario_key]
 
-        vol_mult = (
-            scenario.get("volatility", 0.20)
-            / 0.20
-        )
+        vol_value = scenario.get("volatility", 0.20)
+        if (
+            isinstance(vol_value, bool)
+            or not isinstance(vol_value, numbers.Real)
+            or not math.isfinite(float(vol_value))
+            or float(vol_value) <= 0
+        ):
+            raise ValueError(f"Scenario {scenario_key!r} has invalid volatility.")
+        vol_mult = float(vol_value) / 0.20
 
         spread_mult = scenario.get(
             "spread_mult",
@@ -234,10 +268,19 @@ class MarketDataGenerator:
             1.0,
         )
 
-        adverse_intensity = scenario.get(
-            "adverse_intensity",
-            0.0,
-        )
+        adverse_intensity = scenario.get("adverse_intensity", 0.0)
+        for name, value in (("spread_mult", spread_mult), ("depth_mult", depth_mult),
+                            ("adverse_intensity", adverse_intensity)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or (name in ("spread_mult", "depth_mult") and float(value) <= 0)
+            ):
+                raise ValueError(f"Scenario {scenario_key!r} has invalid {name}.")
+        spread_mult = float(spread_mult)
+        depth_mult = float(depth_mult)
+        adverse_intensity = float(adverse_intensity)
 
         # -------------------------------------------------------------------
         # Initialize stream state
@@ -245,7 +288,7 @@ class MarketDataGenerator:
 
         snapshots: List[MarketSnapshot] = []
 
-        current_price = self.config.initial_price
+        current_price = float(self.config.initial_price)
 
         # ``current_time`` represents the beginning of the next interval.
         current_time = start_time
@@ -699,6 +742,14 @@ class MarketDataGenerator:
         # -------------------------------------------------------------------
         # Generate market snapshots
         # -------------------------------------------------------------------
+
+        if not isinstance(output_name, str) or not output_name.strip():
+            raise ValueError("output_name must be a non-empty filename.")
+        output_path = Path(output_name)
+        if output_path.name != output_name or output_name in {".", ".."}:
+            raise ValueError("output_name must be a filename, not a path.")
+        if output_path.suffix.lower() != ".parquet":
+            raise ValueError("output_name must have a .parquet extension.")
 
         snapshots = self.generate_scenario_stream(
             scenario_key=scenario_key,
