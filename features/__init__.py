@@ -19,6 +19,7 @@ from features.spread import extract_spread_features, calculate_spread_bps
 from features.momentum import extract_momentum_features
 from features.volatility import extract_volatility_features
 from features.trade_flow import extract_trade_flow_features
+from features.regime import detect_market_regime
 
 
 def build_feature_pipeline(
@@ -75,6 +76,7 @@ __all__ = [
     "calculate_depth_imbalance",
     "calculate_multilevel_imbalance",
     "calculate_spread_bps",
+    "detect_market_regime",
     "extract_order_book_features",
     "extract_imbalance_features",
     "extract_spread_features",
