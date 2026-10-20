@@ -150,20 +150,26 @@ class TestNvidiaForecasterPredict:
             enabled=True,
         )
 
-    def test_enabled_with_endpoint_does_not_claim_remote_inference(self) -> None:
+    def test_enabled_with_endpoint_uses_transport_for_real_inference(self) -> None:
+        def fake_transport(url, payload, headers, timeout_sec):
+            assert url == "https://example.com/predict"
+            return {
+                "predicted_return": 0.00042,
+                "model_name": "directional-gru",
+                "model_version": "v1",
+                "confidence": None,
+                "forecast_horizon": FORECAST_HORIZON,
+            }
+
         result = NvidiaForecaster(
             endpoint_url="https://example.com/predict",
             enabled=True,
+            transport=fake_transport,
         ).predict(make_forecast_input(), timestamp=2_000.0)
 
-        assert_safe_fallback(
-            result,
-            timestamp=2_000.0,
-            reason="remote_inference_not_implemented",
-            enabled=True,
-            endpoint_configured=True,
-        )
-        assert "not implemented" in result.metadata["remote_inference_note"].lower()
+        assert result.model_status == ModelStatus.TRAINED
+        assert result.predicted_return == 0.00042
+        assert result.metadata["remote_inference_connected"] is True
 
     def test_context_ending_after_execution_time_is_rejected(self) -> None:
         result = NvidiaForecaster().predict(make_forecast_input(), timestamp=1_018.0)
@@ -307,4 +313,69 @@ class TestNvidiaForecasterPredict:
         assert result.metadata["configured_enabled"] is False
         assert result.metadata["endpoint_configured"] is False
         assert result.metadata["reason"] == "forecaster_disabled"
+
+
+class TestNvidiaForecasterRemoteFailures:
+    def _forecaster(self, transport):
+        return NvidiaForecaster(
+            endpoint_url="https://example.com/predict",
+            enabled=True,
+            transport=transport,
+        )
+
+    def test_timeout_returns_fallback(self) -> None:
+        def transport(*args, **kwargs):
+            raise TimeoutError("timed out")
+
+        result = self._forecaster(transport).predict(make_forecast_input(), timestamp=2_000.0)
+        assert_safe_fallback(result, timestamp=2_000.0, reason="timeout", enabled=True, endpoint_configured=True)
+
+    def test_connection_exception_returns_fallback(self) -> None:
+        def transport(*args, **kwargs):
+            raise ConnectionError("connection refused")
+
+        result = self._forecaster(transport).predict(make_forecast_input(), timestamp=2_000.0)
+        assert result.model_status == ModelStatus.FALLBACK
+        assert result.predicted_return == 0.0
+        assert "connection_failure" in result.metadata["reason"]
+
+    def test_http_500_returns_fallback(self) -> None:
+        def transport(*args, **kwargs):
+            raise RuntimeError("http_status_500")
+
+        result = self._forecaster(transport).predict(make_forecast_input(), timestamp=2_000.0)
+        assert result.model_status == ModelStatus.FALLBACK
+        assert "http_status_500" in result.metadata["reason"]
+
+    def test_malformed_json_object_returns_fallback(self) -> None:
+        result = self._forecaster(lambda *a, **k: ["not-an-object"]).predict(
+            make_forecast_input(), timestamp=2_000.0
+        )
+        assert result.model_status == ModelStatus.FALLBACK
+        assert "invalid_response_schema" in result.metadata["reason"]
+
+    def test_missing_predicted_return_returns_fallback(self) -> None:
+        result = self._forecaster(lambda *a, **k: {"model_name": "x"}).predict(
+            make_forecast_input(), timestamp=2_000.0
+        )
+        assert "missing predicted_return" in result.metadata["reason"]
+
+    def test_nan_predicted_return_returns_fallback(self) -> None:
+        result = self._forecaster(lambda *a, **k: {"predicted_return": nan}).predict(
+            make_forecast_input(), timestamp=2_000.0
+        )
+        assert result.model_status == ModelStatus.FALLBACK
+
+    def test_wrong_predicted_return_type_returns_fallback(self) -> None:
+        result = self._forecaster(lambda *a, **k: {"predicted_return": "0.1"}).predict(
+            make_forecast_input(), timestamp=2_000.0
+        )
+        assert result.model_status == ModelStatus.FALLBACK
+
+    def test_wrong_horizon_returns_fallback(self) -> None:
+        result = self._forecaster(
+            lambda *a, **k: {"predicted_return": 0.1, "forecast_horizon": 9}
+        ).predict(make_forecast_input(), timestamp=2_000.0)
+        assert "wrong horizon" in result.metadata["reason"]
+
 

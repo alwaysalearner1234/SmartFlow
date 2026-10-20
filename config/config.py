@@ -11,6 +11,7 @@ execution risk, while the forecasting model predicts short-term directional
 market movement.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -201,6 +202,23 @@ class ForecastingConfig:
 
     random_seed: int = 42
 
+    # ------------------------------------------------------------------------
+    # Sequence-model training (local DirectionalGRU)
+    # ------------------------------------------------------------------------
+    #
+    # These fields configure the local forecasting trainer only. Remote
+    # Nebius/NVIDIA endpoint settings live on ForecastConfig.
+
+    hidden_size: int = 64
+    num_layers: int = 1
+    dropout: float = 0.1
+    learning_rate: float = 1e-3
+    batch_size: int = 32
+    num_epochs: int = 30
+    patience: int = 5
+    weight_decay: float = 1e-4
+    saved_model_path: Path = SAVED_MODELS_DIR / "directional_forecaster.pt"
+
 
 # ============================================================================
 # Almgren-Chriss Configuration
@@ -239,6 +257,12 @@ class ExecutionConfig:
     decision_interval_sec: float = 2.0
     ac_num_slices: int = 12
 
+    # Directional-forecast magnitude gates (basis points of expected mid move).
+    # Values below forecast_min_move_bps are treated as NEUTRAL so microscopic
+    # predicted returns do not change execution mode.
+    forecast_min_move_bps: float = 2.0
+    forecast_strong_move_bps: float = 8.0
+
 
 # ============================================================================
 # Forecast Configuration
@@ -258,6 +282,7 @@ class ForecastConfig:
     timeout_sec: float = 2.0
     max_staleness_sec: float = 5.0
     forecast_horizon: int = 5
+    api_key: Optional[str] = None
 
 
 # ============================================================================
@@ -458,3 +483,48 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
 # ============================================================================
 
 DEFAULT_CONFIG = SystemConfig()
+
+
+def load_forecast_config_from_env(
+    base: Optional[ForecastConfig] = None,
+) -> ForecastConfig:
+    """Build ForecastConfig from environment variables, overlaying ``base``.
+
+    Recognised variables:
+        SMARTFLOW_FORECAST_ENABLED
+        SMARTFLOW_FORECAST_ENDPOINT
+        SMARTFLOW_FORECAST_TIMEOUT
+        SMARTFLOW_FORECAST_API_KEY
+        SMARTFLOW_FORECAST_MAX_STALENESS
+    """
+    current = base or DEFAULT_CONFIG.forecast
+    enabled_raw = os.environ.get("SMARTFLOW_FORECAST_ENABLED")
+    if enabled_raw is None:
+        enabled = current.enabled
+    else:
+        enabled = enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    endpoint = os.environ.get("SMARTFLOW_FORECAST_ENDPOINT", current.endpoint_url)
+    if endpoint is not None:
+        endpoint = str(endpoint).strip() or None
+
+    timeout_raw = os.environ.get("SMARTFLOW_FORECAST_TIMEOUT")
+    timeout_sec = float(timeout_raw) if timeout_raw else current.timeout_sec
+
+    staleness_raw = os.environ.get("SMARTFLOW_FORECAST_MAX_STALENESS")
+    max_staleness_sec = (
+        float(staleness_raw) if staleness_raw else current.max_staleness_sec
+    )
+
+    api_key = os.environ.get("SMARTFLOW_FORECAST_API_KEY", current.api_key)
+    if api_key is not None:
+        api_key = str(api_key).strip() or None
+
+    return ForecastConfig(
+        enabled=enabled,
+        endpoint_url=endpoint,
+        timeout_sec=timeout_sec,
+        max_staleness_sec=max_staleness_sec,
+        forecast_horizon=current.forecast_horizon,
+        api_key=api_key,
+    )

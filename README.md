@@ -142,12 +142,14 @@ At every decision interval, the engine synthesizes:
 5. **Remaining Quantity:** Order inventory left to liquidate
 
 ### Conceptual Decision Tree:
-- **Near Deadline ($Urgency \ge 0.75$):** Aggressive liquidity sweep to prevent shortfall.
-- **High Adverse Risk ($p \ge 0.65$):**
-  - If high inventory remaining: Cross spread aggressively before adverse price jump occurs.
-  - If low inventory remaining: Withdraw passive quotes to avoid being picked off (winner's curse).
-- **Low Adverse Risk ($p \le 0.35$) & Tight Spread:** Post passive limit orders at best quote to capture spread.
-- **Moderate Risk:** Follow Almgren-Chriss scheduled trajectory.
+SmartFlow separates three signals: adverse-selection toxicity, directional forecast, and Almgren–Chriss urgency.
+
+- **Near Deadline ($Urgency \ge 0.75$):** Aggressive AC-guided slice. Completion always dominates.
+- **High Adverse Risk ($p \ge 0.65$):** Withdraw resting maker exposure. A valid forecast may justify taking liquidity only when waiting is directionally costly; high toxicity never makes a resting order safe.
+- **Low Adverse Risk ($p \le 0.35$):** Post a same-side maker order unless a *valid* strong forecast says waiting is expensive.
+- **Moderate Risk:** Follow the Almgren-Chriss inventory trajectory; a valid forecast may delay or slightly accelerate that slice.
+
+High adverse-selection risk does **not** automatically mean “cross the spread.” See `docs/FORECASTING.md`.
 
 Every decision returns an auditable reason string explaining **WHY** the strategy was chosen.
 
@@ -191,7 +193,7 @@ Metrics calculated from actual executions (no fabricated values):
 ## 10. Installation & Setup
 
 ### Prerequisites
-- Python 3.9+ or 3.10+
+- Python 3.10+ (tested on 3.13)
 - `pip`
 
 ```bash
@@ -199,6 +201,8 @@ git clone https://github.com/your-repo/smart-order-routing.git
 cd smart-order-routing
 pip install -r requirements.txt
 ```
+
+`requirements.txt` pins numpy/pandas/scipy/scikit-learn/xgboost/joblib/torch to the versions used to serialize the saved models. The torch pin is the CPU wheel. For NVIDIA GPU training or Nebius serving, install a CUDA build from https://pytorch.org/get-started/locally/ after the CPU requirements.
 
 ---
 
@@ -216,6 +220,12 @@ python main.py --train
 ```
 Extracts features, trains Logistic Regression and XGBoost models chronologically, outputs genuine classification metrics, and saves the best model to `models/saved/best_adverse_selection_model.joblib`.
 
+### 2b. Train the directional forecast model
+```bash
+python -m models.train_forecaster
+```
+Trains the GRU on chronological 20×14 sequences, keeps the best validation checkpoint, writes honest test metrics, and saves `models/saved/directional_forecaster.pt`. See `docs/FORECASTING.md`.
+
 ### 3. Run Live Execution Demo
 ```bash
 python main.py --run
@@ -227,6 +237,11 @@ Runs a complete end-to-end demonstration showing live order-book processing, fea
 python main.py --backtest
 ```
 Runs Market, TWAP, VWAP, Almgren-Chriss, and Proposed strategies across all 10 experimental scenarios under identical market conditions and prints the comparative summary table.
+
+```bash
+python -m backtest.experiment_runner
+```
+Compares Market, TWAP, VWAP, Almgren–Chriss, Proposed (ML + AC), and SmartFlow (ML + NVIDIA + AC) across existing market scenarios and writes `results/strategy_multiseed_results.csv` and `results/strategy_summary.csv`.
 
 ### 5. Launch Quantitative Trading Terminal Dashboard
 ```bash
@@ -241,9 +256,9 @@ python main.py --dashboard
 
 ## 12. Testing
 
-Execute the comprehensive pytest suite:
+Execute the comprehensive pytest suite (SmartFlow tests only; vendored `python_packages/` is excluded via `pytest.ini`):
 ```bash
-pytest tests/ -v
+pytest -q
 ```
 Tests cover:
 - Microstructure features (micro-price, imbalance, OFI, spread bps, momentum, volatility, trade flow)

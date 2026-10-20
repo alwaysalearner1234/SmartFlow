@@ -14,6 +14,7 @@ from data.contracts import (
     ExecutionContext,
     ForecastResult,
     MarketSnapshot,
+    OrderSide,
     PredictionResult,
     ModelStatus,
 )
@@ -32,6 +33,7 @@ def build_execution_context(
     total_horizon: float,
     ac_model: AlmgrenChrissModel,
     side: OrderSide,
+    max_staleness_sec: Optional[float] = None,
 ) -> ExecutionContext:
     """
     Build an :class:`~data.contracts.ExecutionContext` for the current decision tick.
@@ -106,4 +108,5 @@ def build_execution_context(
         spread_bps=spread_bps,
         top_of_book_depth=top_of_book_depth,
         volatility=volatility,
+        max_staleness_sec=max_staleness_sec,
     )

@@ -5,6 +5,7 @@ from models.preprocessing import (
 )
 from models.train import train_models, evaluate_model
 from models.predictor import AdverseSelectionPredictor
+from models.nvidia_forecaster import NvidiaForecaster
 
 __all__ = [
     "generate_adverse_selection_labels",
@@ -13,4 +14,5 @@ __all__ = [
     "train_models",
     "evaluate_model",
     "AdverseSelectionPredictor",
+    "NvidiaForecaster",
 ]

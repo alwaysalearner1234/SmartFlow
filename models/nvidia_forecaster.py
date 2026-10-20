@@ -1,26 +1,21 @@
-"""NVIDIA forecasting model interface for SmartFlow.
+"""NVIDIA/Nebius remote forecasting client for SmartFlow.
 
-This module defines the model-facing interface for a Nebius-hosted NVIDIA
-forecasting model. The remote request/response schema is not yet specified in
-this repository, so this implementation deliberately does not make HTTP calls.
-Until that schema and endpoint are wired in, ``predict`` returns a safe
-FALLBACK result and records why inference was not performed.
-
-Forecast contract:
-    context window: 20 observations
-    feature count: 14, in NVIDIA_FORECAST_FEATURES order
-    forecast horizon: 5 observations
-    predicted_return: cumulative mid-price return as a decimal
-    expected_move_bps: predicted_return * 10_000
+The client validates a 20 x 14 ``ForecastInput``, serializes it to JSON, and
+posts it to a configured inference endpoint. Any transport or schema failure
+returns a transparent FALLBACK ``ForecastResult``. Remote inference is never
+required for local SmartFlow execution.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from data.contracts import (
     DEFAULT_FORECAST_CONTEXT_WINDOW,
@@ -36,7 +31,24 @@ from data.contracts import (
 NVIDIA_FORECASTER_DEFAULT_HORIZON = DEFAULT_FORECAST_HORIZON
 NVIDIA_FORECASTER_DEFAULT_CONTEXT_WINDOW = DEFAULT_FORECAST_CONTEXT_WINDOW
 NVIDIA_FORECASTER_MODEL_NAME = "nvidia-forecaster"
-NVIDIA_FORECASTER_MODEL_VERSION = "stub-1"
+NVIDIA_FORECASTER_MODEL_VERSION = "nvidia-remote-v1"
+
+HttpTransport = Callable[[str, bytes, Dict[str, str], float], Dict[str, Any]]
+
+
+def default_http_transport(
+    url: str,
+    payload: bytes,
+    headers: Dict[str, str],
+    timeout_sec: float,
+) -> Dict[str, Any]:
+    request = Request(url, data=payload, headers=headers, method="POST")
+    with urlopen(request, timeout=timeout_sec) as response:
+        raw = response.read()
+        status = getattr(response, "status", 200)
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"http_status_{status}")
+    return json.loads(raw.decode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -46,6 +58,7 @@ class _NvidiaForecasterConfig:
     endpoint_url: Optional[str] = None
     timeout_sec: float = 2.0
     enabled: bool = False
+    api_key: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.endpoint_url is not None:
@@ -62,36 +75,31 @@ class _NvidiaForecasterConfig:
 
         if not isinstance(self.enabled, bool):
             raise TypeError("enabled must be a bool.")
+        if self.api_key is not None and (not isinstance(self.api_key, str) or not self.api_key.strip()):
+            raise ValueError("api_key must be None or a non-empty string.")
 
 
 class NvidiaForecaster:
-    """Short-horizon market forecaster with a fail-safe fallback interface.
-
-    ``predict`` intentionally never propagates input/processing errors. A
-    malformed input, a future-dated context window, or an unconnected remote
-    endpoint produces a ``ForecastResult`` with ``ModelStatus.FALLBACK``.
-
-    Important: setting ``enabled=True`` does not activate remote inference yet.
-    An HTTP call is intentionally omitted until the deployed Nebius endpoint's
-    request and response schema is known. This prevents sending incorrectly
-    shaped requests or interpreting an unknown response as a valid forecast.
-    """
+    """Short-horizon market forecaster with a fail-safe remote client."""
 
     def __init__(
         self,
         endpoint_url: Optional[str] = None,
         timeout_sec: float = 2.0,
         enabled: bool = False,
+        api_key: Optional[str] = None,
+        transport: Optional[HttpTransport] = None,
     ) -> None:
         self.config = _NvidiaForecasterConfig(
-            endpoint_url=endpoint_url,
+            endpoint_url=endpoint_url.strip() if isinstance(endpoint_url, str) else endpoint_url,
             timeout_sec=timeout_sec,
             enabled=enabled,
+            api_key=api_key.strip() if isinstance(api_key, str) else api_key,
         )
+        self._transport = transport or default_http_transport
 
     @staticmethod
     def _safe_result_timestamp(timestamp: Any) -> float:
-        """Return a finite numeric timestamp suitable for ForecastResult."""
         if isinstance(timestamp, bool) or not isinstance(timestamp, Real):
             return 0.0
         value = float(timestamp)
@@ -99,7 +107,6 @@ class NvidiaForecaster:
 
     @staticmethod
     def _validate_input(forecast_input: ForecastInput) -> None:
-        """Validate the strict NVIDIA input contract without mutating input."""
         if not isinstance(forecast_input, ForecastInput):
             raise TypeError("forecast_input must be a ForecastInput instance.")
 
@@ -133,10 +140,6 @@ class NvidiaForecaster:
                 f"NVIDIA feature_sequence must have shape {expected_shape}; "
                 f"received {actual_shape}."
             )
-
-        # The ForecastInput contract validates chronology and finite numeric
-        # values on construction. Recheck the dimensions here because lists can
-        # be mutated after the dataclass was constructed.
         if len(forecast_input.timestamps) != NVIDIA_FORECASTER_DEFAULT_CONTEXT_WINDOW:
             raise ValueError(
                 "NVIDIA timestamps must contain exactly "
@@ -165,18 +168,13 @@ class NvidiaForecaster:
             raise ValueError("timestamps must be strictly increasing.")
 
     def _fallback_result(self, timestamp: float, reason: str) -> ForecastResult:
-        """Build a structurally valid fallback result with diagnostic metadata."""
         metadata: Dict[str, Any] = {
             "reason": reason,
             "remote_inference_connected": False,
             "configured_enabled": self.config.enabled,
             "endpoint_configured": self.config.endpoint_url is not None,
+            "provider": "nvidia-remote",
         }
-        if self.config.enabled and self.config.endpoint_url:
-            metadata["remote_inference_note"] = (
-                "Remote inference is not implemented because the Nebius "
-                "request/response schema has not been supplied."
-            )
         return ForecastResult(
             timestamp=timestamp,
             forecast_horizon=NVIDIA_FORECASTER_DEFAULT_HORIZON,
@@ -184,8 +182,62 @@ class NvidiaForecaster:
             model_name=NVIDIA_FORECASTER_MODEL_NAME,
             model_version=NVIDIA_FORECASTER_MODEL_VERSION,
             model_status=ModelStatus.FALLBACK,
+            confidence=None,
             feature_names=list(NVIDIA_FORECAST_FEATURES),
             metadata=metadata,
+        )
+
+    def _serialize_request(self, forecast_input: ForecastInput) -> Dict[str, Any]:
+        return {
+            "feature_sequence": forecast_input.feature_sequence,
+            "feature_names": list(forecast_input.feature_names),
+            "timestamps": list(forecast_input.timestamps),
+            "context_window": forecast_input.context_window,
+            "forecast_horizon": forecast_input.forecast_horizon,
+        }
+
+    def _parse_response(self, payload: Any, timestamp: float) -> ForecastResult:
+        if not isinstance(payload, dict):
+            raise ValueError("response is not a JSON object")
+        if "predicted_return" not in payload:
+            raise ValueError("missing predicted_return")
+        predicted = payload["predicted_return"]
+        if isinstance(predicted, bool) or not isinstance(predicted, Real):
+            raise ValueError("predicted_return has the wrong data type")
+        predicted_return = float(predicted)
+        if not isfinite(predicted_return):
+            raise ValueError("predicted_return is not finite")
+
+        horizon = payload.get("forecast_horizon", NVIDIA_FORECASTER_DEFAULT_HORIZON)
+        if int(horizon) != NVIDIA_FORECASTER_DEFAULT_HORIZON:
+            raise ValueError("wrong horizon")
+
+        confidence = payload.get("confidence")
+        if confidence is not None:
+            if isinstance(confidence, bool) or not isinstance(confidence, Real):
+                raise ValueError("confidence has the wrong data type")
+            confidence = float(confidence)
+            if not isfinite(confidence):
+                raise ValueError("confidence is not finite")
+
+        model_name = str(payload.get("model_name") or "directional-gru")
+        model_version = str(payload.get("model_version") or "v1")
+        return ForecastResult(
+            timestamp=timestamp,
+            forecast_horizon=NVIDIA_FORECASTER_DEFAULT_HORIZON,
+            predicted_return=predicted_return,
+            model_name=model_name,
+            model_version=model_version,
+            model_status=ModelStatus.TRAINED,
+            confidence=confidence,
+            feature_names=list(NVIDIA_FORECAST_FEATURES),
+            metadata={
+                "reason": "remote_inference",
+                "remote_inference_connected": True,
+                "configured_enabled": True,
+                "endpoint_configured": True,
+                "provider": "nvidia-remote",
+            },
         )
 
     def predict(
@@ -193,18 +245,6 @@ class NvidiaForecaster:
         forecast_input: Optional[ForecastInput],
         timestamp: float,
     ) -> ForecastResult:
-        """Return a forecast or a fail-safe FALLBACK result.
-
-        Args:
-            forecast_input: Chronological model input with shape ``(20, 14)``.
-            timestamp: Current execution timestamp. Must not precede the latest
-                timestamp in ``forecast_input``.
-
-        Returns:
-            A ``ForecastResult``. Until remote inference is implemented, every
-            valid call returns FALLBACK with ``predicted_return=0.0``. Errors
-            are converted to FALLBACK results rather than propagated.
-        """
         safe_timestamp = self._safe_result_timestamp(timestamp)
 
         try:
@@ -231,30 +271,62 @@ class NvidiaForecaster:
                     "future_context_timestamp: input window ends after execution timestamp",
                 )
 
-            # Deliberately do not make a network call until the actual Nebius
-            # request/response contract is available and can be tested.
             if not self.config.enabled:
                 return self._fallback_result(safe_timestamp, "forecaster_disabled")
             if not self.config.endpoint_url:
+                return self._fallback_result(safe_timestamp, "endpoint_not_configured")
+
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            if self.config.api_key:
+                headers["Authorization"] = f"Bearer {self.config.api_key}"
+
+            try:
+                payload = json.dumps(self._serialize_request(forecast_input)).encode("utf-8")
+                response = self._transport(
+                    self.config.endpoint_url,
+                    payload,
+                    headers,
+                    float(self.config.timeout_sec),
+                )
+            except TimeoutError:
+                return self._fallback_result(safe_timestamp, "timeout")
+            except HTTPError as exc:
+                return self._fallback_result(safe_timestamp, f"http_error_{exc.code}")
+            except URLError as exc:
+                reason = getattr(exc, "reason", exc)
+                if "timed out" in str(reason).lower():
+                    return self._fallback_result(safe_timestamp, "timeout")
+                return self._fallback_result(safe_timestamp, f"connection_failure: {reason}")
+            except json.JSONDecodeError:
+                return self._fallback_result(safe_timestamp, "invalid_json")
+            except Exception as exc:
+                message = str(exc).lower()
+                if "timed out" in message or "timeout" in message:
+                    return self._fallback_result(safe_timestamp, "timeout")
+                if "http_status_" in message:
+                    return self._fallback_result(safe_timestamp, message)
                 return self._fallback_result(
                     safe_timestamp,
-                    "endpoint_not_configured",
+                    f"connection_failure: {type(exc).__name__}: {exc}",
                 )
-            return self._fallback_result(
-                safe_timestamp,
-                "remote_inference_not_implemented",
-            )
+
+            try:
+                return self._parse_response(response, safe_timestamp)
+            except Exception as exc:
+                return self._fallback_result(
+                    safe_timestamp,
+                    f"invalid_response_schema: {exc}",
+                )
         except Exception as exc:
-            # Preserve the interface's fail-safe behavior for unexpected errors.
             try:
                 return self._fallback_result(
                     safe_timestamp,
                     f"unexpected_error: {type(exc).__name__}: {exc}",
                 )
             except Exception:
-                # The contract's normal constructor should not fail for the
-                # sanitized timestamp and fixed, canonical fields. This last
-                # guard prevents internal errors from escaping predict().
                 return ForecastResult(
                     timestamp=0.0,
                     forecast_horizon=NVIDIA_FORECASTER_DEFAULT_HORIZON,
@@ -274,4 +346,3 @@ __all__ = [
     "NVIDIA_FORECASTER_MODEL_VERSION",
     "NvidiaForecaster",
 ]
-

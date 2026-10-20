@@ -54,6 +54,9 @@ class ExecutionSimulator:
         if not snapshots:
             raise ValueError("Snapshots list cannot be empty.")
 
+        if hasattr(self.strategy_engine, "reset"):
+            self.strategy_engine.reset()
+
         # Precompute features if not provided
         if precomputed_features is not None and len(precomputed_features) == len(snapshots):
             df_features = precomputed_features
@@ -75,6 +78,8 @@ class ExecutionSimulator:
         for tick_idx, snap in enumerate(snapshots):
             elapsed_time = snap.timestamp - start_time
             features_dict = df_features.iloc[tick_idx].to_dict()
+            if hasattr(self.strategy_engine, "observe"):
+                self.strategy_engine.observe(snap, features_dict)
 
             # 1. Process active resting orders against current market tick
             active_orders = order_manager.get_active_orders()
@@ -163,6 +168,8 @@ class ExecutionSimulator:
                         "ac_expected_cost": ctx.ac_expected_cost,
                         "urgency": ctx.urgency,
                         "forecast_predicted_return": ctx.forecast.predicted_return if ctx.forecast else None,
+                        "forecast_direction": ctx.forecast.predicted_direction if ctx.forecast else None,
+                        "forecast_expected_move_bps": ctx.forecast.expected_move_bps if ctx.forecast else None,
                         "forecast_model_status": ctx.forecast.model_status if ctx.forecast else None,
                         "has_valid_forecast": ctx.has_valid_forecast,
                         "is_ml_fallback": ctx.is_ml_fallback,

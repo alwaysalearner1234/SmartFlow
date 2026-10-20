@@ -19,6 +19,7 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 import xgboost as xgb
+import sklearn
 
 from config.config import ModelConfig, SAVED_MODELS_DIR
 from data.contracts import OrderSide
@@ -150,8 +151,16 @@ def train_models(
             "scaler": scaler,
             "feature_names": feature_cols,
             "best_name": best_name,
-            "metrics": results,
+            "metrics": {**results, "feature_importances": feature_importances},
             "config": config,
+            "version": "adverse-selection-v2",
+            "library_versions": {
+                "numpy": np.__version__,
+                "pandas": pd.__version__,
+                "sklearn": sklearn.__version__,
+                "xgboost": xgb.__version__,
+                "joblib": joblib.__version__,
+            },
         }
         joblib.dump(bundle, model_path)
 

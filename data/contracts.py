@@ -1991,7 +1991,8 @@ class ExecutionContext:
     Invariants:
         - has_valid_forecast: forecast is not None and its model_status is in
           {TRAINED, SUCCESS, READY} and forecast.timestamp <= context timestamp
-          (guards against future-data leakage).
+          (guards against future-data leakage) and, when max_staleness_sec is
+          set, the forecast is not older than that allowance.
         - is_ml_fallback: adverse_risk model_status is FALLBACK or
           FALLBACK_HEURISTIC (indicates no trained model available).
     """
@@ -2010,6 +2011,7 @@ class ExecutionContext:
     spread_bps: Optional[float] = None
     top_of_book_depth: Optional[float] = None
     volatility: Optional[float] = None
+    max_staleness_sec: Optional[float] = None
 
     @property
     def has_valid_forecast(self) -> bool:
@@ -2019,14 +2021,21 @@ class ExecutionContext:
 
         A forecast is valid when:
             - it is not None,
-            - its model_status is one of {TRAINED, SUCCESS, READY}, and
-            - its timestamp does not exceed the execution context timestamp.
+            - its model_status is one of {TRAINED, SUCCESS, READY},
+            - its timestamp does not exceed the execution context timestamp, and
+            - if max_staleness_sec is set, age is within that bound.
         """
         if self.forecast is None:
             return False
         if self.forecast.model_status not in {ModelStatus.TRAINED, ModelStatus.SUCCESS, ModelStatus.READY}:
             return False
-        return self.forecast.timestamp <= self.timestamp
+        if self.forecast.timestamp > self.timestamp:
+            return False
+        if self.max_staleness_sec is not None:
+            age = float(self.timestamp) - float(self.forecast.timestamp)
+            if age > float(self.max_staleness_sec):
+                return False
+        return True
 
     @property
     def is_ml_fallback(self) -> bool:
