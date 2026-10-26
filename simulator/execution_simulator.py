@@ -171,6 +171,9 @@ class ExecutionSimulator:
                         "forecast_direction": ctx.forecast.predicted_direction if ctx.forecast else None,
                         "forecast_expected_move_bps": ctx.forecast.expected_move_bps if ctx.forecast else None,
                         "forecast_model_status": ctx.forecast.model_status if ctx.forecast else None,
+                        "forecast_model_name": ctx.forecast.model_name if ctx.forecast else None,
+                        "forecast_horizon": ctx.forecast.forecast_horizon if ctx.forecast else None,
+                        "forecast_reason": ctx.forecast.metadata.get("reason") if ctx.forecast and ctx.forecast.metadata else None,
                         "has_valid_forecast": ctx.has_valid_forecast,
                         "is_ml_fallback": ctx.is_ml_fallback,
                     })

@@ -6,9 +6,10 @@ to the React frontend contract (frontend/src/types.ts).
 """
 
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 import numpy as np
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from data.contracts import OrderSide, MarketSnapshot, ExecutionResult, BacktestResult
 from data.generator import MarketDataGenerator
@@ -34,10 +35,20 @@ from api.schemas import (
     HealthResponse,
     ACSchedulePoint,
     ACScheduleState,
+    ForecastPoint,
+    ForecastState,
 )
-from config.config import DEFAULT_CONFIG
+from config.config import DEFAULT_CONFIG, SCENARIOS
+from models.nvidia_forecaster import NvidiaForecaster
 
 router = APIRouter(prefix="/api/v1", tags=["Dashboard"])
+
+
+class DashboardRunRequest(BaseModel):
+    scenario: str = "normal_market"
+    side: Literal["buy", "sell"] = "buy"
+    order_size: float = Field(default=1000.0, gt=0, le=100000)
+    horizon_sec: float = Field(default=60.0, ge=10, le=300)
 
 BASE_EPOCH = 1700000000.0
 
@@ -146,7 +157,7 @@ class DashboardDataService:
 
         # 3. Execution Simulation via ExecutionSimulator
         exec_res: ExecutionResult = self.simulator.run_execution(
-            strategy_name="Proposed (ML + AC)",
+            strategy_name="SmartFlow (ML + NVIDIA + AC)",
             snapshots=snapshots,
             total_quantity=order_size,
             horizon_sec=horizon_sec,
@@ -270,14 +281,40 @@ class DashboardDataService:
             trajectory=trajectory_points,
         )
 
+        forecast_points = []
+        for pt in exec_res.trajectory:
+            if "forecast_model_status" not in pt:
+                continue
+            status = pt.get("forecast_model_status")
+            valid = bool(pt.get("has_valid_forecast"))
+            forecast_points.append(ForecastPoint(
+                timestamp=_format_iso(float(pt["timestamp"])),
+                expected_move_bps=_finite_metric(pt.get("forecast_expected_move_bps")) if valid else None,
+                direction=pt.get("forecast_direction") if valid else None,
+                model_status=status.value if hasattr(status, "value") else str(status or "UNAVAILABLE"),
+                valid=valid,
+                action=_map_action(pt.get("decision_strategy", ""), pt.get("decision_quantity", 1.0)),
+                decision_reason=str(pt.get("reason", "")),
+            ))
+        forecast_state = None
+        if forecast_points:
+            latest_forecast_pt = exec_res.trajectory[-1]
+            forecast_state = ForecastState(
+                source="nebius" if isinstance(self.simulator.strategy_engine.forecaster, NvidiaForecaster) else "local",
+                model_name=str(latest_forecast_pt.get("forecast_model_name") or "Directional forecaster"),
+                horizon=int(latest_forecast_pt.get("forecast_horizon") or 5),
+                points=forecast_points,
+            )
+
         # 4. Multi-Strategy Performance via Backtester
         backtest_res: BacktestResult = self.backtester.run_backtest(
             snapshots=snapshots,
-            scenario_name="Normal Market",
-            scenario_description="Balanced microstructure conditions",
+            scenario_name=SCENARIOS[scenario_key]["name"],
+            scenario_description=SCENARIOS[scenario_key]["description"],
             total_quantity=order_size,
             horizon_sec=horizon_sec,
             side=side,
+            strategies=["Market", "TWAP", "VWAP", "Almgren-Chriss", "Proposed (ML + AC)", "SmartFlow (ML + NVIDIA + AC)"],
         )
 
         strategy_map: Dict[str, Strategy] = {
@@ -286,6 +323,7 @@ class DashboardDataService:
             "VWAP": "vwap",
             "Almgren-Chriss": "almgren_chriss",
             "Proposed (ML + AC)": "proposed",
+            "SmartFlow (ML + NVIDIA + AC)": "smartflow",
         }
 
         perf_results: List[StrategyResult] = []
@@ -321,6 +359,8 @@ class DashboardDataService:
             execution=execution_state,
             risk=risk_state,
             ac_schedule=ac_schedule,
+            forecast=forecast_state,
+            scenario=scenario_key,
             performance=perf_state,
         )
 
@@ -332,6 +372,16 @@ class DashboardDataService:
         if self._cached_snapshot is None or refresh:
             return self.generate_fresh_snapshot()
         return self._cached_snapshot
+
+    def run(self, request: DashboardRunRequest) -> DashboardSnapshot:
+        if request.scenario not in SCENARIOS:
+            raise ValueError(f"Unknown scenario: {request.scenario}")
+        return self.generate_fresh_snapshot(
+            scenario_key=request.scenario,
+            order_size=request.order_size,
+            horizon_sec=request.horizon_sec,
+            side=OrderSide.BUY if request.side == "buy" else OrderSide.SELL,
+        )
 
 
 # Singleton service instance
@@ -351,3 +401,11 @@ def get_dashboard_snapshot(refresh: bool = Query(False, description="Force re-ge
     the frontend/src/types.ts Phase 1 contract.
     """
     return service.get_snapshot(refresh=refresh)
+
+
+@router.post("/dashboard/run", response_model=DashboardSnapshot)
+def run_dashboard(request: DashboardRunRequest):
+    """Run a configured simulated scenario and return its complete snapshot."""
+    if request.scenario not in SCENARIOS:
+        raise HTTPException(status_code=422, detail="Unknown scenario")
+    return service.run(request)

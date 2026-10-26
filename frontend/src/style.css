@@ -9,6 +9,11 @@ p { color: #aab9c9; }
 .eyebrow { color: #58c4a3; font-size: 12px; font-weight: 800; letter-spacing: .2em; }
 .status { background: #17283a; color: #b8d8ce; padding: 10px 14px; border-radius: 99px; font-size: 13px; }
 .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.run-controls { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; background: #142130; border: 1px solid #283a4c; border-radius: 16px; padding: 18px; margin-bottom: 12px; }
+.run-controls label { display: grid; gap: 6px; color: #aab9c9; font-size: 13px; }
+.run-controls select, .run-controls input { min-height: 38px; min-width: 135px; background: #0c1420; border: 1px solid #3b5269; border-radius: 8px; color: #e8f0f8; padding: 7px 10px; font: inherit; }
+.run-controls button { min-height: 38px; }
+.run-caption { margin: 0 0 16px; text-transform: capitalize; font-size: 13px; }
 button { background: #58c4a3; color: #0c1420; border: 0; border-radius: 99px; padding: 10px 14px; font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
 button:hover { background: #7bdbc0; }
 button:disabled { opacity: .6; cursor: wait; }
@@ -16,6 +21,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .card { min-width: 0; min-height: 240px; background: #142130; border: 1px solid #283a4c; border-radius: 16px; padding: 22px; }
 .feature-card { grid-column: 1 / -1; }
 .ac-card { grid-column: 1 / -1; }
+.performance-card { grid-column: 1 / -1; }
 .chart-heading { font-size: 14px; margin: 18px 0 4px; }
 .feature-note { margin: -8px 0 18px; font-size: 13px; }
 .feature-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
