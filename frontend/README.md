@@ -11,9 +11,10 @@ The frontend uses React, TypeScript, Vite and Plotly. The Python Streamlit dashb
 | Execution | What action was selected, and how much of the order remains? | Person 3 execution/simulation |
 | Risk | How likely are a passive fill and post-fill adverse movement? | Person 2 model plus Person 3 fill model |
 | AC schedule | What quantity does the Almgren–Chriss baseline plan to trade, and at what expected cost? | Person 2 AC model |
+| Directional forecast | What move did the forecaster estimate, and how did it affect a SmartFlow decision? | Local GRU or configured Nebius endpoint |
 | Strategy performance | How did the proposed strategy compare with baselines? | Person 3 backtest |
 
-The initial page shows all four views. Missing sections show an empty state; no result is fabricated.
+The initial page loads a cached default simulation. Use the scenario, side, order-size, and horizon controls to run a fresh simulated execution and comparative backtest. Missing sections show an empty state; no result is fabricated.
 
 ## API contract
 
@@ -29,6 +30,8 @@ The initial page shows all four views. Missing sections show an empty state; no 
   "execution": null,
   "risk": null,
   "ac_schedule": null,
+  "forecast": null,
+  "scenario": null,
   "performance": null
 }
 ```
@@ -39,11 +42,13 @@ All timestamps are UTC ISO 8601 strings. Quantities use the instrument's base un
 
 `ac_schedule` is nullable. When available, React charts planned remaining quantity and per-slice quantity against elapsed seconds and displays expected cost in `cost_unit` (currently USD). The final point closes the schedule with zero slice quantity. `cost_variance` has squared units and is not presented as a currency amount. The AC chart is a planned baseline; the execution trajectory is the realized run.
 
+`forecast` comes from the SmartFlow simulation trajectory. Each point includes an action, decision reason, model status, and validity flag. Expected move and direction are shown only for valid forecasts; fallback values are not plotted as predictions. The source label distinguishes local GRU inference from a configured Nebius endpoint. The forecast horizon is measured in observations, not seconds. The local model did not outperform the zero-return baseline on MAE/MSE in the recorded evaluation, so its output is a demo signal rather than a proven trading advantage.
+
 `features.points` contains up to 80 chronological observations from the existing feature pipeline. Each point supplies spread in bps, L1 depth imbalance as a ratio, instantaneous order-flow imbalance in signed quantity, 10-tick log-return volatility, 5-tick simple-return momentum, and bid/ask depth in base units. Individual metrics may be `null` when unavailable. The Phase 1 `market.order_flow_imbalance` field is a legacy name for bounded L1 depth imbalance; use `features.points[].ofi_instant` for actual order-flow imbalance. Older API responses may omit `features`; React then shows an empty state.
 
-`ExecutionState.trajectory` is ordered by timestamp. Each point contains remaining and cumulative filled quantity, reference price, nullable execution price, and selected action. `PerformanceState.results` contains one entry per available strategy. Chart inputs are these typed arrays; missing or empty arrays produce empty states. Backtest metrics must come from actual simulation output.
+`ExecutionState.trajectory` is ordered by timestamp. Each point contains remaining and cumulative filled quantity, reference price, nullable execution price, and selected action. React shows the remaining-quantity chart, decision timeline, and recent execution rows. `PerformanceState.results` contains one entry per available strategy; React compares six strategies using slippage, market impact, shortfall, and fill rate. Chart inputs are these typed arrays; missing or empty arrays produce empty states. Backtest metrics come from simulation output.
 
-The backend currently supplies `market`, `features`, `execution`, `risk`, `ac_schedule`, and `performance`. The frontend fetches on page load; **Refresh data** calls the API with `?refresh=true` to regenerate one consistent snapshot. Automatic polling can be added when an update cadence is agreed.
+The backend supplies `market`, `features`, `execution`, `risk`, `ac_schedule`, `forecast`, and `performance`. The frontend fetches a default run on page load; **Run simulation + backtest** sends `POST /api/v1/dashboard/run` with the selected scenario, side, order size, and horizon. The response is one consistent snapshot. `GET /api/v1/dashboard/snapshot?refresh=true` remains available for compatibility.
 
 Current API adapter mappings:
 
@@ -68,3 +73,5 @@ npm run dev
 ```
 
 Run `npm run build` to type-check and create a production bundle.
+
+For the demo, run the API and React, select a scenario, and click **Run simulation + backtest**. Show the market and execution charts, then the risk and directional forecast cards, the AC plan, and the six-strategy performance comparison. The page labels the replay as simulated and shows whether forecast inference is local or configured through Nebius.

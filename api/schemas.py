@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 # Domain Literal types
 Side = Literal["buy", "sell"]
-Strategy = Literal["market", "twap", "vwap", "almgren_chriss", "proposed"]
+Strategy = Literal["market", "twap", "vwap", "almgren_chriss", "proposed", "smartflow"]
 Action = Literal["passive", "aggressive", "wait"]
 
 
@@ -101,6 +101,24 @@ class ACScheduleState(BaseModel):
     points: List[ACSchedulePoint]
 
 
+class ForecastPoint(BaseModel):
+    timestamp: str
+    expected_move_bps: Optional[float] = None
+    direction: Optional[str] = None
+    model_status: str
+    valid: bool
+    action: Action
+    decision_reason: str
+
+
+class ForecastState(BaseModel):
+    source: Literal["local", "nebius"]
+    model_name: str
+    horizon: int
+    horizon_unit: Literal["observations"] = "observations"
+    points: List[ForecastPoint]
+
+
 class StrategyResult(BaseModel):
     strategy: Strategy
     filled_quantity: float
@@ -124,6 +142,8 @@ class DashboardSnapshot(BaseModel):
     execution: Optional[ExecutionState] = None
     risk: Optional[RiskState] = None
     ac_schedule: Optional[ACScheduleState] = None
+    forecast: Optional[ForecastState] = None
+    scenario: Optional[str] = None
     performance: Optional[PerformanceState] = None
 
 

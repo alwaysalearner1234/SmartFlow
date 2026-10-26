@@ -96,10 +96,10 @@ def test_dashboard_snapshot_endpoint():
     # Verify Performance section
     assert snapshot.performance is not None
     assert len(snapshot.performance.run_id) > 0
-    assert len(snapshot.performance.results) == 5
+    assert len(snapshot.performance.results) == 6
 
     strategies = [r.strategy for r in snapshot.performance.results]
-    expected_strategies = {"market", "twap", "vwap", "almgren_chriss", "proposed"}
+    expected_strategies = {"market", "twap", "vwap", "almgren_chriss", "proposed", "smartflow"}
     assert set(strategies) == expected_strategies
 
     for r in snapshot.performance.results:
@@ -196,3 +196,34 @@ def test_dashboard_json_round_trip():
     data = response.json()
     assert "risk" in data, "response should contain 'risk' key"
     assert "ac_schedule" in data, "response should contain 'ac_schedule' key"
+
+
+def test_forecast_is_from_smartflow_replay():
+    snapshot = DashboardSnapshot.model_validate(client.get("/api/v1/dashboard/snapshot").json())
+    assert snapshot.forecast is not None
+    assert snapshot.forecast.source in {"local", "nebius"}
+    assert snapshot.forecast.horizon_unit == "observations"
+    assert snapshot.forecast.points
+    assert [p.timestamp for p in snapshot.forecast.points] == [p.timestamp for p in snapshot.execution.trajectory]
+    assert all(p.expected_move_bps is None for p in snapshot.forecast.points if not p.valid)
+
+
+def test_configured_run_changes_scenario_and_side():
+    response = client.post("/api/v1/dashboard/run", json={
+        "scenario": "poor_liquidity", "side": "sell", "order_size": 500, "horizon_sec": 30,
+    })
+    assert response.status_code == 200
+    snapshot = DashboardSnapshot.model_validate(response.json())
+    assert snapshot.scenario == "poor_liquidity"
+    assert snapshot.execution.side == "sell"
+    assert snapshot.execution.target_quantity == 500
+    assert snapshot.ac_schedule.horizon_sec == 30
+    assert snapshot.performance is not None
+    assert len(snapshot.performance.results) == 6
+
+
+def test_configured_run_rejects_unknown_scenario():
+    response = client.post("/api/v1/dashboard/run", json={
+        "scenario": "not_real", "side": "buy", "order_size": 1000, "horizon_sec": 60,
+    })
+    assert response.status_code == 422

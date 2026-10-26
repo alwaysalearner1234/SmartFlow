@@ -1,6 +1,6 @@
 /** Phase 1 dashboard contract. Prices and costs use the instrument's quote currency. */
 export type Side = 'buy' | 'sell';
-export type Strategy = 'market' | 'twap' | 'vwap' | 'almgren_chriss' | 'proposed';
+export type Strategy = 'market' | 'twap' | 'vwap' | 'almgren_chriss' | 'proposed' | 'smartflow';
 export type Action = 'passive' | 'aggressive' | 'wait';
 
 export interface BookLevel {
@@ -91,6 +91,31 @@ export interface ACScheduleState {
   points: ACSchedulePoint[]; // last point closes schedule; slice quantity is zero
 }
 
+export interface ForecastPoint {
+  timestamp: string;
+  expected_move_bps: number | null;
+  direction: string | null;
+  model_status: string;
+  valid: boolean;
+  action: Action;
+  decision_reason: string;
+}
+
+export interface ForecastState {
+  source: 'local' | 'nebius';
+  model_name: string;
+  horizon: number;
+  horizon_unit: 'observations';
+  points: ForecastPoint[];
+}
+
+export interface RunOptions {
+  scenario: 'normal_market' | 'high_volatility' | 'poor_liquidity' | 'high_adverse_selection' | 'low_adverse_selection';
+  side: Side;
+  order_size: number;
+  horizon_sec: number;
+}
+
 export interface StrategyResult {
   strategy: Strategy;
   filled_quantity: number;
@@ -114,5 +139,7 @@ export interface DashboardSnapshot {
   execution: ExecutionState | null;
   risk: RiskState | null;
   ac_schedule?: ACScheduleState | null;
+  forecast?: ForecastState | null;
+  scenario?: string | null;
   performance: PerformanceState | null;
 }
