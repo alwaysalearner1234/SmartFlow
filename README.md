@@ -98,6 +98,8 @@ All features are deterministic and calculated without lookahead bias:
 - **Realized Volatility:** Rolling return standard deviation over 10, 30, 60 ticks and volatility regime ratios.
 - **Trade Flow & CVD:** Buyer- vs. seller-initiated volume, volume imbalance, and Cumulative Volume Delta (CVD).
 
+Feature definitions, units, rolling-window behavior, missing-value conventions, and the canonical forecasting feature order are documented in [`docs/FEATURE_REFERENCE.md`](docs/FEATURE_REFERENCE.md). Shared schemas and cross-module invariants are documented in [`docs/DATA_CONTRACTS.md`](docs/DATA_CONTRACTS.md).
+
 ---
 
 ## 5. Machine Learning Adverse-Selection Model
@@ -202,7 +204,7 @@ cd smart-order-routing
 pip install -r requirements.txt
 ```
 
-`requirements.txt` pins numpy/pandas/scipy/scikit-learn/xgboost/joblib/torch to the versions used to serialize the saved models. The torch pin is the CPU wheel. For NVIDIA GPU training or Nebius serving, install a CUDA build from https://pytorch.org/get-started/locally/ after the CPU requirements.
+`requirements.txt` pins numpy/pandas/scipy/scikit-learn/xgboost/joblib/torch to the versions used to serialize the saved models and includes PyArrow for the bundled Parquet datasets and Parquet output. The torch pin is the CPU wheel. For NVIDIA GPU training or Nebius serving, install a CUDA build from https://pytorch.org/get-started/locally/ after the CPU requirements.
 
 ---
 
@@ -255,6 +257,12 @@ python main.py --dashboard
 ---
 
 ## 12. Testing
+
+Before a release, validate the checked-in sample datasets and reproducibility with:
+```bash
+python -m pytest -q tests/test_person1_data_readiness.py
+python scripts/verify_pipeline.py
+```
 
 Execute the comprehensive pytest suite (SmartFlow tests only; vendored `python_packages/` is excluded via `pytest.ini`):
 ```bash

@@ -1,4 +1,4 @@
-"""Run a deterministic, local-only SmartFlow pipeline verification.
+r"""Run a deterministic, local-only SmartFlow pipeline verification.
 
 From the repository root:
     python .\scripts\verify_pipeline.py
