@@ -1,6 +1,74 @@
-# SmartFlow | Smart Order Routing & Risk-Aware Trade Execution
+# SmartFlow
 
-A production-quality quantitative trading system that models high-frequency market microstructure, predicts short-term adverse-selection risk with machine learning (Logistic Regression baseline and XGBoost), couples predictions with closed-form Almgren–Chriss execution-cost trajectories, dynamically orchestrates execution strategies (Market, TWAP, VWAP, Passive Maker, Aggressive Taker, AC Slicing, and Proposed Risk-Aware SOR), simulates fills under realistic market physics, and performs rigorous, identical-market backtesting visualized through an institutional Streamlit terminal.
+**AI-powered, risk-aware trade execution.**
+
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Built for the **Nebius x NVIDIA Global AI Hackathon**.
+
+SmartFlow is a research prototype that combines market microstructure signals, adverse-selection prediction, directional forecasting, and Almgren–Chriss scheduling. Its execution engine adapts between passive, aggressive, and wait actions, while a React + Plotly dashboard makes the decisions and simulated results visible.
+
+**[Watch the demo](https://youtu.be/dxCX0aahgyU)** · [Quick start](#quick-start) · [Dashboard gallery](#dashboard-gallery) · [Forecasting](docs/FORECASTING.md) · [Data contracts](docs/DATA_CONTRACTS.md)
+
+![SmartFlow market microstructure dashboard showing spread, imbalance, volatility, momentum, and book depth](docs/images/market-microstructure.png)
+
+## What you can explore
+
+- Configure simulated market scenarios, order direction, quantity, and execution horizon.
+- Inspect the order book, market features, remaining inventory, and decision timeline.
+- View adverse-selection risk separately from directional forecasts, with explicit model status and fallback handling.
+- Compare the AC plan with execution output and benchmark six strategies on a shared market replay.
+
+**Demo environment:** simulated market data with local GRU inference. The codebase includes a configurable Nebius inference client/server path; the linked recording demonstrates the local workflow. The saved GRU did not outperform the zero-return baseline on MAE/MSE in the recorded evaluation. See [forecasting methodology and limitations](docs/FORECASTING.md) for details.
+
+## Quick start
+
+You need Python and pip, plus Node.js and npm for the React dashboard. The project documents Python 3.10+ and was tested on Python 3.13. Install the pinned Python dependencies to match the bundled model artifacts.
+
+```bash
+git clone https://github.com/alwaysalearner1234/SmartFlow.git
+cd SmartFlow
+python -m pip install -r requirements.txt
+```
+
+Start the API from the repository root:
+
+```bash
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+In a second terminal, start React:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Open **http://localhost:5173/**, select a scenario, and click **Run simulation + backtest**. API documentation is available at **http://127.0.0.1:8000/docs**. See the [frontend README](frontend/README.md) for the response contract and the [usage section](#11-usage) for training, experiments, and the Streamlit reference dashboard.
+
+## Dashboard gallery
+
+These are actual screenshots of the React dashboard using a simulated replay. Click an image to inspect it at full resolution.
+
+### Risk and directional forecasting
+
+[![Adverse-selection history alongside a local GRU directional forecast, model status, and decision explanation](docs/images/risk-and-forecast.png)](docs/images/risk-and-forecast.png)
+
+### Almgren–Chriss execution plan
+
+[![Planned remaining inventory, per-slice quantities, and expected execution cost](docs/images/ac-schedule.png)](docs/images/ac-schedule.png)
+
+### Six-strategy comparison
+
+[![Simulated slippage, market impact, implementation shortfall, and fill rates for six strategies](docs/images/strategy-comparison.png)](docs/images/strategy-comparison.png)
+
+The React dashboard is in [`frontend/`](frontend/README.md), served by [`api/`](api/main.py). A separate Streamlit reference dashboard lives in [`dashboard/`](dashboard/app.py).
 
 ---
 
@@ -81,7 +149,9 @@ Backtesting & Performance Analytics (backtest/)
   └── 10-Scenario Stress Testing (backtest/comparison.py)
   │
   ▼
-Refinitiv/Bloomberg Dark Terminal Dashboard (dashboard/app.py)
+Dashboard API (api/)
+  ├── React + Plotly dashboard (frontend/)
+  └── Streamlit reference dashboard (dashboard/app.py)
 ```
 
 ---
@@ -197,11 +267,12 @@ Metrics calculated from actual executions (no fabricated values):
 ### Prerequisites
 - Python 3.10+ (tested on 3.13)
 - `pip`
+- Node.js and npm for the React frontend
 
 ```bash
-git clone https://github.com/your-repo/smart-order-routing.git
-cd smart-order-routing
-pip install -r requirements.txt
+git clone https://github.com/alwaysalearner1234/SmartFlow.git
+cd SmartFlow
+python -m pip install -r requirements.txt
 ```
 
 `requirements.txt` pins numpy/pandas/scipy/scikit-learn/xgboost/joblib/torch to the versions used to serialize the saved models and includes PyArrow for the bundled Parquet datasets and Parquet output. The torch pin is the CPU wheel. For NVIDIA GPU training or Nebius serving, install a CUDA build from https://pytorch.org/get-started/locally/ after the CPU requirements.
@@ -228,11 +299,11 @@ python -m models.train_forecaster
 ```
 Trains the GRU on chronological 20×14 sequences, keeps the best validation checkpoint, writes honest test metrics, and saves `models/saved/directional_forecaster.pt`. See `docs/FORECASTING.md`.
 
-### 3. Run Live Execution Demo
+### 3. Run an Execution Replay Demo
 ```bash
 python main.py --run
 ```
-Runs a complete end-to-end demonstration showing live order-book processing, feature extraction, ML risk scoring, AC scheduling, dynamic strategy shifts, order fills, and execution metrics.
+Runs an end-to-end simulated replay showing order-book processing, feature extraction, ML risk scoring, AC scheduling, dynamic strategy shifts, order fills, and execution metrics.
 
 ### 4. Run Multi-Strategy Backtesting
 ```bash
@@ -245,7 +316,25 @@ python -m backtest.experiment_runner
 ```
 Compares Market, TWAP, VWAP, Almgren–Chriss, Proposed (ML + AC), and SmartFlow (ML + NVIDIA + AC) across existing market scenarios and writes `results/strategy_multiseed_results.csv` and `results/strategy_summary.csv`.
 
-### 5. Launch Quantitative Trading Terminal Dashboard
+### 5. Launch the React Dashboard
+
+From the repository root:
+
+```bash
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Open http://localhost:5173/. The dashboard exposes scenario controls, market features, risk/forecast views, execution history, an AC plan, and a six-strategy comparison.
+
+### 6. Launch the Streamlit Reference Dashboard
 ```bash
 streamlit run dashboard/app.py
 ```
@@ -293,4 +382,13 @@ Distributed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ## 15. React Frontend
 
-The React + Plotly frontend and its data contract live in [frontend/](frontend/README.md). It reads market, feature-history, execution, and performance data from the FastAPI service in `api/`. The Streamlit dashboard above remains a functional reference. See the frontend README for startup commands and the remaining risk-data contract.
+The React + Plotly frontend and its data contract live in [frontend/](frontend/README.md). The FastAPI service supplies market features, execution history, risk estimates, directional forecasts, the AC plan, and backtest results. Model status and unavailable metrics are displayed explicitly. See the frontend README for startup commands and request/response details.
+
+## Team
+
+| Contributor | Primary area |
+| --- | --- |
+| Anay | Market data and feature engineering |
+| Ariv | Machine learning and quantitative modeling |
+| Lidiya | Execution, simulation, backtesting, and backend integration |
+| Tuan | React dashboard, visualization, and frontend integration |
